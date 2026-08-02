@@ -1,0 +1,63 @@
+{% extends "_base.html" %}
+{% block content %}
+<span class="page-eyebrow">Integrations</span>
+<h1 class="page-title">Connect a coding agent</h1>
+<p class="page-lead">
+  Five integrations are tested end-to-end. Pick one and copy its config block. Every snippet is parameterised on the API URL above.
+</p>
+
+<div class="card" x-data="integrationCards()" x-init="load()">
+  <p style="color: var(--mute); margin-bottom: 16px;">
+    Click a tab to switch, then <strong>Copy</strong> to grab the snippet.
+  </p>
+
+  <div style="display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px;">
+    <template x-for="(s, i) in snippets" :key="s.label">
+      <button class="btn btn-ghost"
+              :class="{ 'is-selected': i === selected }"
+              :style="i === selected ? 'background: var(--accent-soft); color: var(--accent); border-color: var(--accent-soft);' : ''"
+              @click="selected = i"
+              x-text="s.label"></button>
+    </template>
+  </div>
+
+  <template x-if="snippets.length">
+    <div>
+      <p style="color: var(--mute); font-size: 13px; margin-bottom: 8px;" x-text="snippets[selected].description"></p>
+      <div style="position: relative;">
+        <pre x-text="snippets[selected].body"></pre>
+        <button class="btn btn-ghost"
+                style="position: absolute; top: 8px; right: 8px; padding: 4px 10px; font-size: 12px;"
+                @click="copySnippet($event)">Copy</button>
+      </div>
+    </div>
+  </template>
+</div>
+
+
+<script>
+function integrationCards() {
+  return {
+    snippets: [],
+    selected: 0,
+    async load() {
+      try {
+        const r = await fetch('/api/integrations', { credentials: 'same-origin' });
+        if (r.ok) {
+          const data = await r.json();
+          this.snippets = data.snippets || [];
+        }
+      } catch (e) {}
+    },
+    copySnippet(ev) {
+      const text = this.snippets[this.selected].body;
+      navigator.clipboard.writeText(text);
+      const btn = ev.target;
+      const original = btn.textContent;
+      btn.textContent = 'Copied ✓';
+      setTimeout(() => { btn.textContent = original; }, 1200);
+    }
+  };
+}
+</script>
+{% endblock %}

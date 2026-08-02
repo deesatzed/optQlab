@@ -1,0 +1,147 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="hubApp()" x-init="init()">
+  <h1 style="margin-top: 0;">Hub</h1>
+  <p class="hint">Browse published OptiQ quants, search Hugging Face, and load any model into the server with one click.</p>
+
+  <div class="card">
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <input type="text" x-model="query" @keydown.enter="search()"
+             placeholder="Search Hugging Face (MLX models)…" style="flex:1; min-width:220px;">
+      <label style="display:flex; gap:6px; align-items:center; white-space:nowrap;">
+        <input type="checkbox" x-model="optiqOnly" @change="search()"> OptiQ only
+      </label>
+      <button class="btn" @click="search()" :disabled="searching" x-text="searching ? 'Searching…' : 'Search'"></button>
+    </div>
+  </div>
+
+  <template x-if="notice">
+    <div class="flash" :class="noticeErr ? 'flash-error' : 'flash-success'" x-text="notice"></div>
+  </template>
+
+  {# Published OptiQ quants #}
+  <h2>Published OptiQ quants</h2>
+  <div class="hint" x-show="loadingPublished">Loading from Hugging Face…</div>
+  <div class="hub-grid">
+    <template x-for="m in published" :key="m.repo_id">
+      <div class="card hub-card">
+        <div class="hub-name" x-text="m.repo_id"></div>
+        <div class="hub-meta">
+          <span class="pill pill-idle" x-text="m.family"></span>
+          <span class="pill pill-idle" x-text="m.size"></span>
+          <span class="pill pill-idle" x-text="m.bits"></span>
+          <span class="hub-dl" x-text="'↓ ' + m.downloads"></span>
+        </div>
+        <div class="hub-actions">
+          <button class="btn" @click="load(m.repo_id, $event)">Load to server</button>
+          <a class="btn btn-ghost" :href="chatUrl(m.repo_id)">Chat</a>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  {# HF search results #}
+  <template x-if="results.length">
+    <div>
+      <h2>Hugging Face results</h2>
+      <div class="hub-grid">
+        <template x-for="m in results" :key="m.repo_id">
+          <div class="card hub-card">
+            <div class="hub-name" x-text="m.repo_id"></div>
+            <div class="hub-meta">
+              <template x-for="t in m.tags" :key="t"><span class="pill pill-idle" x-text="t"></span></template>
+              <span class="hub-dl" x-text="'↓ ' + m.downloads + '  ♥ ' + m.likes"></span>
+            </div>
+            <div class="hub-actions">
+              <button class="btn" @click="load(m.repo_id, $event)">Load to server</button>
+              <a class="btn btn-ghost" :href="chatUrl(m.repo_id)">Chat</a>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </template>
+
+  {# Local converted models #}
+  <template x-if="local.length">
+    <div>
+      <h2>Local models</h2>
+      <div class="hub-grid">
+        <template x-for="m in local" :key="m.path">
+          <div class="card hub-card">
+            <div class="hub-name" x-text="m.name"></div>
+            <div class="hub-meta">
+              <span class="pill pill-idle">local</span>
+              <template x-if="m.vision"><span class="pill pill-ok">vision</span></template>
+            </div>
+            <div class="hub-actions">
+              <button class="btn" @click="load(m.path, $event)">Load to server</button>
+              <a class="btn btn-ghost" :href="chatUrl(m.path)">Chat</a>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </template>
+</div>
+
+<style>
+.hub-grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(280px,1fr)); gap:12px; margin-bottom:18px; }
+.hub-card { display:flex; flex-direction:column; gap:8px; }
+.hub-name { font-family: var(--mono, monospace); font-size:13px; word-break:break-all; }
+.hub-meta { display:flex; gap:6px; align-items:center; flex-wrap:wrap; font-size:12px; color:var(--mute); }
+.hub-dl { margin-left:auto; }
+.hub-actions { display:flex; gap:8px; margin-top:auto; }
+</style>
+
+<script>
+function hubApp() {
+  return {
+    query: '', optiqOnly: true, searching: false,
+    published: [], results: [], local: [],
+    loadingPublished: true, notice: '', noticeErr: false,
+    async init() {
+      try {
+        const r = await fetch('/api/server/published', {credentials:'same-origin'});
+        const d = await r.json();
+        if (d.ok) this.published = d.quants || [];
+      } catch(e) {}
+      this.loadingPublished = false;
+      try {
+        const r = await fetch('/api/hub/local', {credentials:'same-origin'});
+        const d = await r.json();
+        if (d.ok) this.local = d.models || [];
+      } catch(e) {}
+    },
+    async search() {
+      this.searching = true; this.notice = '';
+      try {
+        const u = '/api/hub/search?q=' + encodeURIComponent(this.query) + (this.optiqOnly ? '&optiq=1' : '');
+        const r = await fetch(u, {credentials:'same-origin'});
+        const d = await r.json();
+        this.results = d.ok ? (d.models || []) : [];
+        if (!d.ok) { this.notice = d.error || 'search failed'; this.noticeErr = true; }
+      } catch(e) { this.notice = String(e); this.noticeErr = true; }
+      this.searching = false;
+    },
+    async load(model, ev) {
+      const btn = ev.target; const orig = btn.textContent;
+      btn.textContent = 'Loading…'; btn.disabled = true;
+      this.notice = '';
+      try {
+        const r = await fetch('/api/server/apply', {
+          method:'POST', credentials:'same-origin',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({model})
+        });
+        const d = await r.json();
+        if (d.ok) { this.notice = 'Loaded ' + model + ' into the server.'; this.noticeErr = false; }
+        else { this.notice = d.error || 'load failed'; this.noticeErr = true; }
+      } catch(e) { this.notice = String(e); this.noticeErr = true; }
+      btn.textContent = orig; btn.disabled = false;
+    },
+    chatUrl(model) { return '/chat?model=' + encodeURIComponent(model); }
+  };
+}
+</script>
+{% endblock %}

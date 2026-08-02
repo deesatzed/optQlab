@@ -1,0 +1,1090 @@
+"""Architecture compatibility registry and runtime-contract checks."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from optiq.runtime.mtp.profiles import DEFAULT_PROFILE_NAME, PROFILE_CHOICES, resolve_profile_name
+
+
+RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
+SUPPORTED_ARCH_IDS = {
+    "qwen3-next-mtp",
+    "deepseek-v3-mtp",
+    "glm-moe-dsa-mtp",
+    "glm4-moe-mtp",
+    "glm4-moe-lite-mtp",
+    "mimo-mtp",
+    "nemotron-h-mtp",
+}
+
+TIER_VERIFIED = "verified"
+TIER_FAMILY_COMPATIBLE_UNVERIFIED = "family-compatible-unverified"
+TIER_ARCH_COMPATIBLE_UNVERIFIED = "architecture-compatible-but-unverified"
+TIER_INCOMPATIBLE_ARCHITECTURE = "incompatible-architecture"
+TIER_NO_MTP = "no-MTP"
+
+EXIT_VERIFIED = 0
+EXIT_NO_MTP = 2
+EXIT_UNVERIFIED = 3
+EXIT_INCOMPATIBLE_ARCHITECTURE = 4
+
+
+class ModelCompatibilityError(RuntimeError):
+    exit_code = 1
+
+
+class UnverifiedArchitectureError(ModelCompatibilityError):
+    exit_code = EXIT_UNVERIFIED
+
+
+class IncompatibleArchitectureError(ModelCompatibilityError):
+    exit_code = EXIT_INCOMPATIBLE_ARCHITECTURE
+
+
+class NoMTPError(ModelCompatibilityError):
+    exit_code = EXIT_NO_MTP
+
+
+@dataclass(frozen=True)
+class ArchitectureSupport:
+    arch_id: str
+    display_name: str
+    family: str
+    backend: str | None
+    support_level: str
+    runtime_compatibility: str
+    can_run_verified: bool = False
+    aliases: tuple[str, ...] = ()
+    config_markers: tuple[str, ...] = ("mtp_num_hidden_layers", "num_nextn_predict_layers")
+    family_gate: str = "none"
+    references: tuple[str, ...] = ()
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "arch_id": self.arch_id,
+            "display_name": self.display_name,
+            "family": self.family,
+            "backend": self.backend,
+            "support_level": self.support_level,
+            "runtime_compatibility": self.runtime_compatibility,
+            "can_run_verified": self.can_run_verified,
+            "aliases": list(self.aliases),
+            "config_markers": list(self.config_markers),
+            "family_gate": self.family_gate,
+            "references": list(self.references),
+            "notes": self.notes,
+        }
+
+
+ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
+    "qwen3-next-mtp": ArchitectureSupport(
+        arch_id="qwen3-next-mtp",
+        display_name="Qwen3-Next / Qwen3.5 MTP",
+        family="qwen",
+        backend="qwen3_next",
+        support_level="verified-native",
+        runtime_compatibility="native",
+        can_run_verified=True,
+        aliases=("qwen3_5_mtp", "qwen3_6_mtp", "qwen3-next", "qwen3_5"),
+        family_gate="qwen-mtp-sidecar-or-embedded",
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/qwen3_next_mtp.py",
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/qwen3_5_mtp.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/qwen3_next.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/qwen3_5.py",
+        ),
+        notes="Product-verified default backend; this remains the only promoted shipping runtime.",
+    ),
+    "deepseek-v3-mtp": ArchitectureSupport(
+        arch_id="deepseek-v3-mtp",
+        display_name="DeepSeek V3 / V3.2 MTP",
+        family="deepseek",
+        backend="deepseek_mtp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=("deepseek_mtp", "deepseek_v3", "deepseek_v32"),
+        family_gate="appended-layer-mtp-markers",
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/config/speculative.py",
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/deepseek_mtp.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/deepseek_v3.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/deepseek_v32.py",
+        ),
+        notes="Experimental native backend is present for verified-contract models; exactness and performance still need per-model QA before promotion.",
+    ),
+    "glm-moe-dsa-mtp": ArchitectureSupport(
+        arch_id="glm-moe-dsa-mtp",
+        display_name="GLM MoE DSA MTP",
+        family="glm",
+        backend="deepseek_mtp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=("glm_moe_dsa", "glm_moe_dsa_mtp"),
+        family_gate="appended-layer-mtp-markers",
+        references=(
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/glm_moe_dsa.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/deepseek_v32.py",
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/deepseek_mtp.py",
+        ),
+        notes=(
+            "GLM MoE DSA is an mlx-lm DeepSeek V3.2-derived architecture; "
+            "MTPLX routes verified-contract artifacts through the DeepSeek MTP backend."
+        ),
+    ),
+    "deepseek-v4-mtp": ArchitectureSupport(
+        arch_id="deepseek-v4-mtp",
+        display_name="DeepSeek V4 MTP",
+        family="deepseek",
+        backend="deepseek_v4_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("deepseek_v4", "deepseek_v4_mtp"),
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/deepseek_v4_mtp.py",
+        ),
+        notes="Detected separately because vLLM split the V4 MTP implementation from DeepSeek V3.",
+    ),
+    "glm4-moe-mtp": ArchitectureSupport(
+        arch_id="glm4-moe-mtp",
+        display_name="GLM-4 MoE MTP",
+        family="glm",
+        backend="glm_mtp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=("glm4_moe_mtp", "glm4_moe"),
+        family_gate="appended-layer-mtp-markers",
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/glm4_moe_mtp.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/glm4_moe.py",
+        ),
+        notes="Experimental native backend is present for verified-contract GLM-4 MoE MTP artifacts; real-checkpoint exactness/performance QA is still required before promotion.",
+    ),
+    "glm4-moe-lite-mtp": ArchitectureSupport(
+        arch_id="glm4-moe-lite-mtp",
+        display_name="GLM-4 MoE Lite MTP",
+        family="glm",
+        backend="glm_mtp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=("glm4_moe_lite_mtp", "glm4_moe_lite"),
+        family_gate="appended-layer-mtp-markers",
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/glm4_moe_lite_mtp.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/glm4_moe_lite.py",
+        ),
+        notes="Experimental native backend is present for verified-contract GLM-4 MoE Lite MTP artifacts; the Lite MLA cache/key rewrite is handled separately from plain GLM-4 MoE.",
+    ),
+    "glm-ocr-mtp": ArchitectureSupport(
+        arch_id="glm-ocr-mtp",
+        display_name="GLM OCR MTP",
+        family="glm",
+        backend="glm_ocr_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("glm_ocr_mtp", "glm_ocr"),
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/glm_ocr_mtp.py",
+        ),
+        notes="Recognized for compatibility reporting; not a target runtime backend yet.",
+    ),
+    "minimax-m2-mtp": ArchitectureSupport(
+        arch_id="minimax-m2-mtp",
+        display_name="MiniMax M2 MTP",
+        family="minimax",
+        backend="minimax_m2",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=(
+            "minimax_m2",
+            "minimax_m2_5",
+            "minimax_m25",
+            "minimax_m2_6",
+            "minimax_m26",
+            "MiniMaxM2ForCausalLM",
+            "MiniMaxM25ForCausalLM",
+            "MiniMaxM26ForCausalLM",
+        ),
+        config_markers=("num_mtp_modules", "num_nextn_predict_layers", "mtp_num_hidden_layers"),
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/minimax_m2.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/minimax.py",
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/llama_eagle3.py",
+        ),
+        notes=(
+            "MiniMax M2-family speculative support in vLLM is EAGLE3-style "
+            "auxiliary-hidden drafting, not the native MTP proposer contract MTPLX "
+            "uses for Qwen/DeepSeek/GLM/MiMo/Nemotron-H."
+        ),
+    ),
+    "mimo-mtp": ArchitectureSupport(
+        arch_id="mimo-mtp",
+        display_name="MiMo MTP",
+        family="mimo",
+        backend="mimo_mtp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=("mimo_mtp", "MiMoForCausalLM", "mimo"),
+        family_gate="mimo-layer0-mtp-markers",
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/mimo_mtp.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/mimo.py",
+        ),
+        notes="Experimental native backend is present for verified-contract MiMo artifacts; vLLM's proposer only supports one-token draft depth today.",
+    ),
+    "gemma-mtp": ArchitectureSupport(
+        arch_id="gemma-mtp",
+        display_name="Gemma MTP marker variant",
+        family="gemma",
+        backend="gemma_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("gemma3", "gemma4", "gemma_mtp"),
+        references=(
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/gemma4.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/gemma3.py",
+        ),
+        notes="Mainline Gemma configs are no-MTP unless an explicit MTP marker is present.",
+    ),
+    "ernie-mtp": ArchitectureSupport(
+        arch_id="ernie-mtp",
+        display_name="ERNIE MoE MTP",
+        family="ernie",
+        backend="ernie_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("ernie_mtp", "ernie4_5_moe"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/ernie_mtp.py",),
+    ),
+    "nemotron-h-mtp": ArchitectureSupport(
+        arch_id="nemotron-h-mtp",
+        display_name="Nemotron-H MTP",
+        family="nemotron",
+        backend="nemotron_h_mtp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=("nemotron_h_mtp", "nemotron_h", "nemotron_h_puzzle"),
+        family_gate="nemotron-h-pattern-mtp-markers",
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/nemotron_h_mtp.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/nemotron_h.py",
+        ),
+        notes=(
+            "Experimental native backend for vLLM-style Nemotron-H MTP predictor "
+            "artifacts. Supports the one-step MTP path whose pattern contains "
+            "attention/MoE blocks only."
+        ),
+    ),
+    "exaone-moe-mtp": ArchitectureSupport(
+        arch_id="exaone-moe-mtp",
+        display_name="EXAONE MoE MTP",
+        family="exaone",
+        backend="exaone_moe_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("exaone_moe_mtp", "exaone_moe"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/exaone_moe_mtp.py",),
+    ),
+    "exaone4-5-mtp": ArchitectureSupport(
+        arch_id="exaone4-5-mtp",
+        display_name="EXAONE 4.5 MTP",
+        family="exaone",
+        backend="exaone4_5_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("exaone4_5_mtp", "exaone4_5"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/exaone4_5_mtp.py",),
+    ),
+    "longcat-flash-mtp": ArchitectureSupport(
+        arch_id="longcat-flash-mtp",
+        display_name="LongCat Flash MTP",
+        family="longcat",
+        backend="longcat_flash_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("longcat_flash_mtp", "longcat_flash"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/longcat_flash_mtp.py",),
+    ),
+    "pangu-ultra-moe-mtp": ArchitectureSupport(
+        arch_id="pangu-ultra-moe-mtp",
+        display_name="Pangu Ultra MoE MTP",
+        family="pangu",
+        backend="pangu_ultra_moe_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("pangu_ultra_moe_mtp", "pangu_ultra_moe", "openpangu_mtp", "openpangu"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/openpangu_mtp.py",),
+    ),
+    "step3p5-mtp": ArchitectureSupport(
+        arch_id="step3p5-mtp",
+        display_name="Step-3.5 MTP",
+        family="step",
+        backend="step3p5_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("step3p5_mtp", "step3p5"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/step3p5_mtp.py",),
+    ),
+    "hy-v3-mtp": ArchitectureSupport(
+        arch_id="hy-v3-mtp",
+        display_name="HY V3 MTP",
+        family="hy",
+        backend="hy_v3_mtp",
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("hy_v3_mtp", "hy_v3"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/hy_v3_mtp.py",),
+    ),
+    "generic-mtp": ArchitectureSupport(
+        arch_id="generic-mtp",
+        display_name="Generic MTP marker",
+        family="generic",
+        backend=None,
+        support_level="recognized-backend-pending",
+        runtime_compatibility="recognized-backend-pending",
+        aliases=("mtp", "nextn"),
+        references=("REFERENCES:TOOLS/vllm-official-main/vllm/config/speculative.py",),
+        notes="Fallback for explicit MTP/nextn configs whose family is not mapped yet.",
+    ),
+}
+
+
+def architecture_catalog() -> list[dict[str, Any]]:
+    return [support.to_dict() for support in ARCHITECTURE_CATALOG.values()]
+
+
+def architecture_support_for(arch_id: str | None) -> ArchitectureSupport | None:
+    if not arch_id:
+        return None
+    key = str(arch_id).strip().lower()
+    if key in ARCHITECTURE_CATALOG:
+        return ARCHITECTURE_CATALOG[key]
+    normalized = key.replace("_", "-")
+    if normalized in ARCHITECTURE_CATALOG:
+        return ARCHITECTURE_CATALOG[normalized]
+    for support in ARCHITECTURE_CATALOG.values():
+        aliases = {alias.lower().replace("_", "-") for alias in support.aliases}
+        if normalized in aliases:
+            return support
+    return None
+
+
+@dataclass(frozen=True)
+class RuntimeContract:
+    mtplx_version: str
+    arch_id: str
+    mtp_depth_max: int
+    recommended_profile: str
+    exactness_baseline: dict[str, Any]
+    verified_on: dict[str, Any]
+    recommended_draft_lm_head: dict[str, Any] | None = None
+    recommended_draft_sampler: dict[str, Any] | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuntimeContract":
+        missing = [
+            key
+            for key in (
+                "mtplx_version",
+                "arch_id",
+                "mtp_depth_max",
+                "recommended_profile",
+                "exactness_baseline",
+                "verified_on",
+            )
+            if key not in data
+        ]
+        if missing:
+            raise ValueError(f"runtime contract missing required keys: {', '.join(missing)}")
+        raw_profile = str(data["recommended_profile"])
+        profile = resolve_profile_name(raw_profile)
+        if profile not in PROFILE_CHOICES:
+            raise ValueError(f"runtime contract has invalid recommended_profile: {profile}")
+        depth = int(data["mtp_depth_max"])
+        if depth <= 0:
+            raise ValueError("runtime contract mtp_depth_max must be positive")
+        recommended_draft_lm_head = None
+        if data.get("recommended_draft_lm_head") is not None:
+            from optiq.runtime.mtp.draft_lm_head import normalize_draft_lm_head_spec
+
+            recommended_draft_lm_head = normalize_draft_lm_head_spec(
+                data.get("recommended_draft_lm_head")
+            )
+        recommended_draft_sampler = None
+        if data.get("recommended_draft_sampler") is not None:
+            from optiq.runtime.mtp.draft_sampling import normalize_draft_sampler_spec
+
+            recommended_draft_sampler = normalize_draft_sampler_spec(
+                data.get("recommended_draft_sampler")
+            )
+        return cls(
+            mtplx_version=str(data["mtplx_version"]),
+            arch_id=str(data["arch_id"]),
+            mtp_depth_max=depth,
+            recommended_profile=profile,
+            exactness_baseline=dict(data["exactness_baseline"]),
+            verified_on=dict(data["verified_on"]),
+            recommended_draft_lm_head=recommended_draft_lm_head,
+            recommended_draft_sampler=recommended_draft_sampler,
+            raw=dict(data),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {
+            "mtplx_version": self.mtplx_version,
+            "arch_id": self.arch_id,
+            "mtp_depth_max": self.mtp_depth_max,
+            "recommended_profile": self.recommended_profile,
+            "exactness_baseline": self.exactness_baseline,
+            "verified_on": self.verified_on,
+        }
+        if self.recommended_draft_lm_head is not None:
+            out["recommended_draft_lm_head"] = dict(self.recommended_draft_lm_head)
+        if self.recommended_draft_sampler is not None:
+            out["recommended_draft_sampler"] = dict(self.recommended_draft_sampler)
+        return out
+
+
+@dataclass(frozen=True)
+class CompatibilityVerdict:
+    tier: str
+    arch_id: str | None
+    supported: bool
+    recognized: bool
+    can_run: bool
+    exit_code: int
+    message: str
+    recommended_backend: str | None = None
+    recommended_profile: str | None = None
+    runtime_contract: RuntimeContract | None = None
+    runtime_contract_path: str | None = None
+    runtime_contract_error: str | None = None
+    unsafe_force_required: bool = False
+    unverified_model: bool = False
+    mtp_supported: str = "no"
+    runtime_compatibility: str = "unsupported"
+    support_level: str = "unsupported"
+    support_notes: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tier": self.tier,
+            "arch_id": self.arch_id,
+            "supported": self.supported,
+            "recognized": self.recognized,
+            "can_run": self.can_run,
+            "exit_code": self.exit_code,
+            "message": self.message,
+            "recommended_backend": self.recommended_backend,
+            "recommended_profile": self.recommended_profile,
+            "runtime_contract": (
+                self.runtime_contract.to_dict() if self.runtime_contract else None
+            ),
+            "runtime_contract_path": self.runtime_contract_path,
+            "runtime_contract_error": self.runtime_contract_error,
+            "unsafe_force_required": self.unsafe_force_required,
+            "unverified_model": self.unverified_model,
+            "mtp_supported": self.mtp_supported,
+            "runtime_compatibility": self.runtime_compatibility,
+            "support_level": self.support_level,
+            "support_notes": self.support_notes,
+        }
+
+
+def _contract_path(model_dir: Path) -> Path:
+    return model_dir / RUNTIME_CONTRACT_FILE
+
+
+def load_runtime_contract(model_dir: Path | str) -> tuple[RuntimeContract | None, str | None]:
+    path = _contract_path(Path(model_dir))
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return RuntimeContract.from_dict(data), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _text(value: Any) -> str:
+    return str(value or "").lower().replace("-", "_")
+
+
+def _compact(value: str) -> str:
+    return _text(value).replace("_", "").replace(" ", "")
+
+
+def _alias_matches(combined: str, alias: str) -> bool:
+    alias_text = _text(alias)
+    if not alias_text:
+        return False
+    return alias_text in combined or _compact(alias_text) in _compact(combined)
+
+
+def _support_alias_matches(support: ArchitectureSupport, combined: str) -> bool:
+    aliases = (support.arch_id, *support.aliases)
+    return any(_alias_matches(combined, alias) for alias in aliases)
+
+
+def _detect_arch_id(inspection: Any) -> str | None:
+    architecture = _text(getattr(inspection, "architecture", None))
+    model_type = _text(getattr(inspection, "model_type", None))
+    combined = f"{architecture} {model_type}"
+    has_config_mtp = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) > 0
+    has_explicit_mtp = has_config_mtp or "mtp" in combined or "nextn" in combined
+
+    qwen_support = ARCHITECTURE_CATALOG["qwen3-next-mtp"]
+    if _support_alias_matches(qwen_support, combined):
+        return "qwen3-next-mtp"
+
+    supports = [
+        support
+        for support in ARCHITECTURE_CATALOG.values()
+        if support.arch_id not in {"qwen3-next-mtp", "generic-mtp"}
+    ]
+    supports.sort(
+        key=lambda row: max(
+            (len(_compact(alias)) for alias in (row.arch_id, *row.aliases)),
+            default=0,
+        ),
+        reverse=True,
+    )
+    for support in supports:
+        if has_explicit_mtp and _support_alias_matches(support, combined):
+            return support.arch_id
+    if "mtp" in combined or "nextn" in combined:
+        return "generic-mtp"
+    return None
+
+
+def _has_mtp_markers(inspection: Any) -> bool:
+    mtp = getattr(inspection, "mtp", None)
+    return bool(
+        int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) > 0
+        or (mtp is not None and bool(getattr(mtp, "exists", False)))
+    )
+
+
+def _passes_verified_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool) -> bool:
+    return _passes_family_runtime_gate(arch_id, inspection, tensor_gate)
+
+
+def _weight_keys(inspection: Any) -> tuple[str, ...]:
+    return tuple(str(key) for key in (getattr(inspection, "weight_keys", ()) or ()))
+
+
+_APPENDED_LAYER_MARKER_SUFFIXES = (
+    "enorm.weight",
+    "hnorm.weight",
+    "eh_proj.weight",
+    "shared_head.norm.weight",
+    "shared_head.head.weight",
+)
+
+
+def _has_marker_under_prefixes(
+    keys: tuple[str, ...],
+    prefixes: tuple[str, ...],
+    suffixes: tuple[str, ...],
+    substrings: tuple[str, ...] = (),
+) -> bool:
+    for key in keys:
+        for prefix in prefixes:
+            if not key.startswith(prefix):
+                continue
+            suffix = key.removeprefix(prefix)
+            if suffix.endswith(suffixes) or any(marker in suffix for marker in substrings):
+                return True
+    return False
+
+
+def _has_all_suffixes_under_prefixes(
+    keys: tuple[str, ...],
+    prefixes: tuple[str, ...],
+    suffixes: tuple[str, ...],
+) -> bool:
+    for suffix in suffixes:
+        if not any(key.startswith(prefix) and key.removeprefix(prefix).endswith(suffix) for key in keys for prefix in prefixes):
+            return False
+    return True
+
+
+def _passes_appended_layer_gate(inspection: Any) -> bool:
+    keys = _weight_keys(inspection)
+    if not keys:
+        return False
+    start = int(getattr(inspection, "num_hidden_layers", 0) or 0)
+    count = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0)
+    if start <= 0 or count <= 0:
+        return False
+    for local_idx in range(count):
+        layer_idx = start + local_idx
+        prefixes = (
+            f"model.layers.{layer_idx}.",
+            f"mtp.layers.{local_idx}.",
+            f"layers.{local_idx}.",
+        )
+        if not _has_marker_under_prefixes(
+            keys,
+            prefixes,
+            _APPENDED_LAYER_MARKER_SUFFIXES,
+            ("mtp_block.",),
+        ):
+            return False
+    return True
+
+
+def _passes_mimo_layer_gate(inspection: Any) -> bool:
+    keys = _weight_keys(inspection)
+    if not keys:
+        return False
+    start = int(getattr(inspection, "num_hidden_layers", 0) or 0)
+    count = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0)
+    if start <= 0 or count <= 0:
+        return False
+    # The current MiMo proposer path is one-token MTP; gate the layer it can
+    # actually execute while keeping deeper configured layers unpromoted.
+    prefixes = (
+        "model.mtp_layers.0.",
+        f"model.mtp_layers.{start}.",
+        f"model.layers.{start}.",
+        "mtp.layers.0.",
+        "layers.0.",
+    )
+    return _has_marker_under_prefixes(
+        keys,
+        prefixes,
+        (
+            "token_layernorm.weight",
+            "hidden_layernorm.weight",
+            "input_proj.weight",
+            "final_layernorm.weight",
+        ),
+        ("mtp_block.",),
+    )
+
+
+def _passes_nemotron_h_gate(inspection: Any) -> bool:
+    keys = _weight_keys(inspection)
+    if not keys:
+        return False
+    if int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) != 1:
+        return False
+    pattern = str(getattr(inspection, "mtp_pattern", None) or "")
+    if not pattern or not set(pattern).issubset({"*", "E"}):
+        return False
+    start = int(getattr(inspection, "num_hidden_layers", 0) or 0)
+    if start <= 0:
+        return False
+    physical_layers = len(pattern)
+    for local_idx in range(physical_layers):
+        prefixes = (
+            f"mtp.layers.{local_idx}.",
+            f"layers.{local_idx}.",
+            f"model.layers.{start + local_idx}.",
+            f"backbone.layers.{start + local_idx}.",
+        )
+        has_layer_body = False
+        for key in keys:
+            for prefix in prefixes:
+                if not key.startswith(prefix):
+                    continue
+                suffix = key.removeprefix(prefix)
+                if suffix == "norm.weight" or suffix.startswith("mixer."):
+                    has_layer_body = True
+                    break
+            if has_layer_body:
+                break
+        if not has_layer_body:
+            return False
+    first_prefixes = (
+        "mtp.layers.0.",
+        "layers.0.",
+        f"model.layers.{start}.",
+        f"backbone.layers.{start}.",
+    )
+    if not _has_all_suffixes_under_prefixes(
+        keys,
+        first_prefixes,
+        ("enorm.weight", "hnorm.weight", "eh_proj.weight"),
+    ):
+        return False
+    last_idx = physical_layers - 1
+    last_prefixes = (
+        f"mtp.layers.{last_idx}.",
+        f"layers.{last_idx}.",
+        f"model.layers.{start + last_idx}.",
+        f"backbone.layers.{start + last_idx}.",
+    )
+    return _has_marker_under_prefixes(keys, last_prefixes, ("final_layernorm.weight",))
+
+
+def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool) -> bool:
+    if arch_id == "qwen3-next-mtp":
+        return bool(
+            tensor_gate
+            and int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) > 0
+        )
+    if arch_id in {
+        "deepseek-v3-mtp",
+        "glm-moe-dsa-mtp",
+        "glm4-moe-mtp",
+        "glm4-moe-lite-mtp",
+    }:
+        return _passes_appended_layer_gate(inspection)
+    if arch_id == "mimo-mtp":
+        return _passes_mimo_layer_gate(inspection)
+    if arch_id == "nemotron-h-mtp":
+        return _passes_nemotron_h_gate(inspection)
+    return False
+
+
+def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
+    model_dir = Path(getattr(inspection, "model_dir", "."))
+    contract_data = getattr(inspection, "runtime_contract_data", None)
+    contract_error = getattr(inspection, "runtime_contract_error", None)
+    if contract_data is not None:
+        try:
+            contract = RuntimeContract.from_dict(dict(contract_data))
+            contract_error = None
+        except Exception as exc:
+            contract = None
+            contract_error = str(exc)
+    else:
+        contract, local_contract_error = load_runtime_contract(model_dir)
+        contract_error = contract_error or local_contract_error
+    detected_arch_id = _detect_arch_id(inspection)
+    has_mtp = _has_mtp_markers(inspection)
+    mtp_artifact = getattr(inspection, "mtp", None)
+    tensor_gate = bool(getattr(mtp_artifact, "passes_tensor_gate", False))
+    mtp_artifact_exists = bool(getattr(mtp_artifact, "exists", False))
+    contract_path = getattr(inspection, "runtime_contract_path", None)
+    if not contract_path:
+        contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+
+    if contract is not None:
+        arch_id = contract.arch_id
+        support = architecture_support_for(arch_id)
+        if (
+            arch_id in SUPPORTED_ARCH_IDS
+            and has_mtp
+            and _passes_verified_runtime_gate(arch_id, inspection, tensor_gate)
+        ):
+            return CompatibilityVerdict(
+                tier=TIER_VERIFIED,
+                arch_id=arch_id,
+                supported=True,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message="Verified MTPLX runtime contract found.",
+                recommended_backend=(support.backend if support else None),
+                recommended_profile=contract.recommended_profile,
+                runtime_contract=contract,
+                runtime_contract_path=contract_path,
+                mtp_supported="yes",
+                runtime_compatibility=(support.runtime_compatibility if support else "native"),
+                support_level=(support.support_level if support else "verified-native"),
+                support_notes=(support.notes if support else None),
+            )
+        if arch_id not in SUPPORTED_ARCH_IDS:
+            if support is not None:
+                return CompatibilityVerdict(
+                    tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+                    arch_id=support.arch_id,
+                    supported=False,
+                    recognized=True,
+                    can_run=False,
+                    exit_code=EXIT_UNVERIFIED,
+                    message=(
+                        f"{support.display_name} runtime contract detected and "
+                        "recognized, but MTPLX does not yet have a native MLX "
+                        "runtime backend for this family."
+                    ),
+                    recommended_backend=support.backend,
+                    runtime_contract=contract,
+                    runtime_contract_path=contract_path,
+                    mtp_supported="recognized" if has_mtp else "partial",
+                    runtime_compatibility=support.runtime_compatibility,
+                    support_level=support.support_level,
+                    support_notes=support.notes,
+                    unverified_model=True,
+                )
+            return CompatibilityVerdict(
+                tier=TIER_INCOMPATIBLE_ARCHITECTURE,
+                arch_id=arch_id,
+                supported=False,
+                recognized=False,
+                can_run=False,
+                exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
+                message=(
+                    f"{arch_id} runtime contract detected; not supported in "
+                    "v0.2.0. Planned for a later backend."
+                ),
+                runtime_contract=contract,
+                runtime_contract_path=contract_path,
+                mtp_supported="partial" if has_mtp else "no",
+                runtime_compatibility="unsupported",
+            )
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=arch_id,
+            supported=False,
+            recognized=True,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                "Runtime contract exists but local MTP artifact inspection did not "
+                "pass; refusing to run without repair."
+            ),
+            recommended_backend=(support.backend if support else "qwen3_next"),
+            recommended_profile=contract.recommended_profile,
+            runtime_contract=contract,
+            runtime_contract_path=contract_path,
+            runtime_contract_error=contract_error,
+            unsafe_force_required=True,
+            unverified_model=True,
+            mtp_supported="partial",
+            runtime_compatibility="needs-grafting",
+            support_level="native-backend-needs-contract-repair",
+            support_notes=(support.notes if support else None),
+        )
+
+    if contract_error:
+        support = architecture_support_for(detected_arch_id)
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=support is not None,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=f"Invalid {RUNTIME_CONTRACT_FILE}: {contract_error}",
+            recommended_backend=(support.backend if support else None),
+            runtime_contract_path=contract_path,
+            runtime_contract_error=contract_error,
+            unsafe_force_required=detected_arch_id == "qwen3-next-mtp",
+            unverified_model=True,
+            mtp_supported="partial" if has_mtp else "no",
+            runtime_compatibility=(
+                "needs-grafting"
+                if detected_arch_id == "qwen3-next-mtp"
+                else (support.runtime_compatibility if support else "unsupported")
+            ),
+            support_level=(support.support_level if support else "unsupported"),
+            support_notes=(support.notes if support else None),
+        )
+
+    if detected_arch_id == "qwen3-next-mtp":
+        support = architecture_support_for(detected_arch_id)
+        marker_text = (
+            "Qwen3-Next MTP markers detected"
+            if has_mtp
+            else "Qwen3-Next architecture detected"
+        )
+        if support is not None and _passes_family_runtime_gate(detected_arch_id, inspection, tensor_gate):
+            return CompatibilityVerdict(
+                tier=TIER_FAMILY_COMPATIBLE_UNVERIFIED,
+                arch_id=detected_arch_id,
+                supported=True,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"{marker_text}; native MTP tensors match the supported "
+                    "Qwen family layout. No mtplx_runtime.json exactness "
+                    "baseline is present, so runs are marked unverified until "
+                    "a first-load smoke baseline is recorded."
+                ),
+                recommended_backend="qwen3_next",
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unsafe_force_required=False,
+                unverified_model=True,
+                mtp_supported="yes",
+                runtime_compatibility="native-family-gated",
+                support_level="native-family-auto-smoke",
+                support_notes=(support.notes if support else None),
+            )
+        if not mtp_artifact_exists:
+            return CompatibilityVerdict(
+                tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+                arch_id=detected_arch_id,
+                supported=False,
+                recognized=True,
+                can_run=False,
+                exit_code=EXIT_UNVERIFIED,
+                message=(
+                    f"{marker_text}, but this folder does not contain runnable "
+                    "Qwen MTP tensors. mtplx_runtime.json is optional metadata; "
+                    "the blocker is missing MTP weights. Use a model with "
+                    "mtp.safetensors, embedded mtp.* / language_model.mtp.* "
+                    "weights, or graft an MTP sidecar into this base model."
+                ),
+                recommended_backend="qwen3_next",
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unsafe_force_required=False,
+                unverified_model=True,
+                mtp_supported="no",
+                runtime_compatibility="missing-mtp-weights",
+                support_level="native-backend-missing-mtp-weights",
+                support_notes=(support.notes if support else None),
+            )
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=True,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                f"{marker_text}, and an MTP artifact is present, but its tensor "
+                "layout does not match the Qwen native MTP runtime gate. "
+                "mtplx_runtime.json is optional metadata; repair or regenerate "
+                "the MTP sidecar/embedded weights so the tensor gate passes."
+            ),
+            recommended_backend="qwen3_next",
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unsafe_force_required=False,
+            unverified_model=True,
+            mtp_supported="partial",
+            runtime_compatibility="invalid-mtp-tensor-layout",
+            support_level="native-backend-invalid-mtp-tensors",
+            support_notes=(support.notes if support else None),
+        )
+
+    support = architecture_support_for(detected_arch_id)
+    if support is not None and has_mtp:
+        family_gate = _passes_family_runtime_gate(
+            support.arch_id,
+            inspection,
+            tensor_gate,
+        )
+        if support.can_run_verified and family_gate:
+            return CompatibilityVerdict(
+                tier=TIER_FAMILY_COMPATIBLE_UNVERIFIED,
+                arch_id=support.arch_id,
+                supported=True,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"{support.display_name} MTP markers and tensor layout "
+                    "match a supported native backend. No mtplx_runtime.json "
+                    "exactness baseline is present, so runs are marked "
+                    "unverified until a first-load smoke baseline is recorded."
+                ),
+                recommended_backend=support.backend,
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unsafe_force_required=False,
+                unverified_model=True,
+                mtp_supported="yes",
+                runtime_compatibility="native-family-gated",
+                support_level="native-family-auto-smoke",
+                support_notes=support.notes,
+            )
+        if support.can_run_verified:
+            return CompatibilityVerdict(
+                tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+                arch_id=support.arch_id,
+                supported=False,
+                recognized=True,
+                can_run=False,
+                exit_code=EXIT_UNVERIFIED,
+                message=(
+                    f"{support.display_name} markers recognized and a native "
+                    "backend exists, but no verified mtplx_runtime.json contract "
+                    "is present for this artifact."
+                ),
+                recommended_backend=support.backend,
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unverified_model=True,
+                mtp_supported="recognized",
+                runtime_compatibility="needs-contract",
+                support_level=support.support_level,
+                support_notes=support.notes,
+            )
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=support.arch_id,
+            supported=False,
+            recognized=True,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                f"{support.display_name} MTP markers recognized, but MTPLX does "
+                "not yet have a native MLX runtime backend for this family."
+            ),
+            recommended_backend=support.backend,
+            unverified_model=True,
+            mtp_supported="recognized",
+            runtime_compatibility=support.runtime_compatibility,
+            support_level=support.support_level,
+            support_notes=support.notes,
+        )
+
+    if not has_mtp:
+        return CompatibilityVerdict(
+            tier=TIER_NO_MTP,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=support is not None,
+            can_run=False,
+            exit_code=EXIT_NO_MTP,
+            message=(
+                "Model has no MTP head. MTPLX requires an MTP-equipped model."
+            ),
+            mtp_supported="no",
+            runtime_compatibility="unsupported",
+            support_level=(support.support_level if support else "unsupported"),
+            support_notes=(support.notes if support else None),
+        )
+
+    return CompatibilityVerdict(
+        tier=TIER_INCOMPATIBLE_ARCHITECTURE,
+        arch_id=detected_arch_id or "generic-mtp",
+        supported=False,
+        recognized=False,
+        can_run=False,
+        exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
+        message=(
+            f"{detected_arch_id or 'generic MTP'} detected; not supported in "
+            "v0.2.0 because no supported native MLX runtime family "
+            "matched this artifact."
+        ),
+        mtp_supported="partial",
+        runtime_compatibility="unsupported",
+    )
+
+
+def require_verified_or_raise(
+    inspection: Any,
+    *,
+    unsafe_force_unverified: bool = False,
+    yes: bool = False,
+) -> CompatibilityVerdict:
+    verdict = compatibility_for_inspection(inspection)
+    if verdict.can_run:
+        return verdict
+    if (
+        unsafe_force_unverified
+        and yes
+        and verdict.tier == TIER_ARCH_COMPATIBLE_UNVERIFIED
+        and verdict.unsafe_force_required
+    ):
+        return verdict
+    if verdict.tier == TIER_NO_MTP:
+        raise NoMTPError(verdict.message)
+    if verdict.tier == TIER_INCOMPATIBLE_ARCHITECTURE:
+        raise IncompatibleArchitectureError(verdict.message)
+    raise UnverifiedArchitectureError(verdict.message)

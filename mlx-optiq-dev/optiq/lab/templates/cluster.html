@@ -1,0 +1,252 @@
+{% extends "_base.html" %}
+{% block content %}
+<style>
+  .cl-summary{display:flex;gap:0;border:1px solid var(--rule);border-radius:8px;overflow:hidden;margin:0 0 24px;background:var(--paper-2)}
+  .cl-summary > div{flex:1;padding:16px 20px;border-right:1px solid var(--rule-soft)}
+  .cl-summary > div:last-child{border-right:0}
+  .cl-summary .num{font-family:var(--mono);font-size:22px;color:var(--ink);display:block;line-height:1}
+  .cl-summary .num.ok{color:var(--accent)} .cl-summary .num.warn{color:var(--warn)}
+  .cl-summary .lbl{font-family:var(--mono);font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:.08em;margin-top:7px;display:block}
+  .topo-card{padding:0;overflow:hidden}
+  .topo-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:12px;color:var(--mute);text-transform:uppercase;letter-spacing:.06em}
+  .btn-mini{font-family:var(--mono);font-size:11px;background:transparent;border:1px solid var(--rule);border-radius:5px;padding:4px 10px;cursor:pointer;color:var(--ink-2)}
+  .btn-mini:hover{border-color:var(--accent);color:var(--accent)}
+  .topo-stage{padding:40px 28px;background:radial-gradient(circle at 1px 1px,rgba(19,19,18,.04) 1px,transparent 0);background-size:22px 22px}
+  .topo-empty{text-align:center;color:var(--mute);font-size:14px;padding:32px}
+  .topo-row{display:flex;align-items:center;justify-content:center;gap:0;flex-wrap:wrap}
+  .topo-node{width:210px;border:1px solid var(--rule);border-radius:10px;background:var(--paper);padding:18px;position:relative;box-shadow:0 1px 0 rgba(0,0,0,.03)}
+  .topo-node.self{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-soft)}
+  .tn-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px}
+  .tn-rank{font-family:var(--mono);font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:.08em}
+  .tn-self-badge{font-family:var(--mono);font-size:9px;color:var(--accent);background:var(--accent-soft);padding:2px 7px;border-radius:999px;text-transform:uppercase;letter-spacing:.06em}
+  .tn-chip{font-family:var(--display);font-variation-settings:"opsz" 36,"wght" 500;font-size:26px;color:var(--ink);line-height:1;letter-spacing:-.02em}
+  .tn-name{font-family:var(--mono);font-size:11px;color:var(--mute);margin:4px 0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tn-ram-bar{height:7px;border-radius:4px;background:var(--paper-3);overflow:hidden;margin-bottom:5px}
+  .tn-ram-fill{height:100%;background:var(--accent);border-radius:4px;transition:width .5s}
+  .tn-meta{font-family:var(--mono);font-size:10.5px;color:var(--mute);display:flex;justify-content:space-between}
+  .tn-share{margin-top:10px;font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:.04em}
+  /* link between nodes */
+  .topo-link{width:130px;height:70px;position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center}
+  .topo-link svg{width:100%;height:38px;overflow:visible}
+  .topo-link .lk-rtt{font-family:var(--mono);font-size:10.5px;margin-bottom:2px;letter-spacing:.03em}
+  .topo-link .lk-kind{font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:.08em;margin-top:2px}
+  .lk-fast .lk-rtt,.lk-fast .lk-kind{color:var(--accent)}
+  .lk-slow .lk-rtt,.lk-slow .lk-kind{color:var(--warn)}
+  .lk-wire{stroke-width:2.5;fill:none}
+  .lk-fast .lk-wire{stroke:var(--accent);stroke-dasharray:7 5;animation:march 0.7s linear infinite}
+  .lk-slow .lk-wire{stroke:#b8a98e;stroke-dasharray:3 6}
+  @keyframes march{to{stroke-dashoffset:-24}}
+  .lk-dot{fill:var(--accent)}
+  .lk-fast .lk-flow{animation:flow 1.6s ease-in-out infinite}
+  @keyframes flow{0%{transform:translateX(0);opacity:0}15%{opacity:1}85%{opacity:1}100%{transform:translateX(112px);opacity:0}}
+  @media (prefers-reduced-motion:reduce){.lk-fast .lk-wire,.lk-fast .lk-flow{animation:none}}
+  .cl-serve{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
+  .cl-serve input{flex:1;min-width:260px;font-family:var(--mono);font-size:13px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper)}
+  .cl-err{color:var(--warn);font-family:var(--mono);font-size:12px;margin-top:10px;white-space:pre-wrap}
+  .cl-active{margin-top:16px;border:1px solid var(--accent);background:var(--accent-soft);
+    border-radius:10px;padding:16px 18px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  .cl-active-title{font-weight:600;color:var(--ink);font-size:15px}
+  .cl-active-sub{color:var(--ink-2);font-size:13px;margin-top:3px}
+  .cl-chat{margin-top:14px;border-top:1px solid var(--rule-soft);padding-top:14px}
+  .cl-msgs{display:flex;flex-direction:column;gap:10px;margin-bottom:12px;max-height:340px;overflow-y:auto}
+  .cl-msg{padding:10px 14px;border-radius:8px;font-size:14px;line-height:1.5;max-width:85%}
+  .cl-msg.user{align-self:flex-end;background:var(--accent);color:var(--paper)}
+  .cl-msg.bot{align-self:flex-start;background:var(--paper-2);border:1px solid var(--rule-soft)}
+  .cl-msg .via{font-family:var(--mono);font-size:9.5px;color:var(--mute);margin-top:6px;letter-spacing:.04em}
+</style>
+
+<div x-data="clusterPanel()" x-init="init()">
+  <span class="page-eyebrow">Distributed · inference</span>
+  <h1 class="page-title">Cluster</h1>
+  <p class="page-lead">
+    Connect two or more Macs over Thunderbolt and use them as one. Peers are
+    found automatically, so there are no IPs or hostfiles to set up. OptiQ splits
+    a model's layers across the Macs by RAM and keeps them <em>resident</em>, so
+    the combined memory serves models that wouldn't fit on any one machine.
+  </p>
+
+  <div class="cl-summary" x-show="nodes.length">
+    <div><span class="num" x-text="nodes.length"></span><span class="lbl">nodes</span></div>
+    <div><span class="num" x-text="combinedRam"></span><span class="lbl">combined&nbsp;RAM</span></div>
+    <div><span class="num" x-text="combinedSpare"></span><span class="lbl">fits&nbsp;now</span></div>
+    <div><span class="num" :class="tbUp?'ok':'warn'" x-text="tbUp?'⚡ up':'down'"></span><span class="lbl">thunderbolt</span></div>
+    <div><span class="num" :class="serving?'ok':''" x-text="serving?'serving':'idle'"></span><span class="lbl">status</span></div>
+  </div>
+
+  <!-- TOPOLOGY -->
+  <div class="card topo-card">
+    <div class="topo-head">
+      <span>Topology</span>
+      <button class="btn-mini" @click="refresh()" x-text="loading?'…':'↻ refresh'"></button>
+    </div>
+    <div class="topo-stage">
+      <template x-if="!nodes.length">
+        <div class="topo-empty">
+          Looking for Macs on Thunderbolt.<br>
+          Run <code>optiq cluster up</code> on your other Mac, connected over Thunderbolt.
+        </div>
+      </template>
+      <div class="topo-row" x-show="nodes.length">
+        <template x-for="(n, i) in nodes" :key="n.name + i">
+          <div style="display:flex;align-items:center">
+            <template x-if="i > 0">
+              <div class="topo-link" :class="linkClass(n)">
+                <span class="lk-rtt" x-text="rttLabel(n)"></span>
+                <svg viewBox="0 0 112 20" preserveAspectRatio="none">
+                  <line class="lk-wire" x1="0" y1="10" x2="112" y2="10"/>
+                  <circle class="lk-dot lk-flow" cx="0" cy="10" r="3.5"/>
+                </svg>
+                <span class="lk-kind" x-text="n.link"></span>
+              </div>
+            </template>
+            <div class="topo-node" :class="{self:n.is_self}">
+              <div class="tn-top">
+                <span class="tn-rank">rank <span x-text="i"></span></span>
+                <template x-if="n.is_self"><span class="tn-self-badge">this mac</span></template>
+              </div>
+              <div class="tn-chip" x-text="n.chip"></div>
+              <div class="tn-name" x-text="n.name"></div>
+              <div class="tn-ram-bar"><div class="tn-ram-fill" :style="`width:${ramPct(n)}%`"></div></div>
+              <div class="tn-meta">
+                <span x-text="n.ram + ' GB'"></span>
+                <span x-text="freeOf(n)===null ? 'free ?' : (freeOf(n) + ' GB free')"></span>
+              </div>
+              <div class="tn-share"
+                   x-text="freeOf(n)===null ? 'memory unknown'
+                           : ('can hold ' + spare(n).toFixed(1) + ' GB · ≈ ' + sharePct(i) + '% of layers')"></div>
+              <template x-if="n.degraded">
+                <div class="tn-warn"
+                     :title="'macOS never shrinks its swap file, so this Mac keeps a depressed free-memory figure until it restarts.'">
+                  ⚠ <span x-text="n.swap + ' GB swapped'"></span> · restart this Mac
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- SERVE CONTROL -->
+  <div class="card" style="margin-top:20px">
+    <h2 style="margin-top:0">Serve a model on the cluster</h2>
+    <p class="muted" style="font-size:14px;margin-bottom:14px">
+      Serves the model split across the ring, with an OpenAI endpoint that Chat
+      and Arena use automatically. Thunderbolt only. Pipeline inference needs the
+      low latency, so a slow link is refused rather than run slower than one Mac.
+      Layers are held <em>resident</em>, so the model has to fit the
+      <strong x-text="combinedSpare"></strong> the cluster can spare right now;
+      anything larger is refused before it loads. Free up memory on a busy Mac to
+      make room for a bigger model.
+    </p>
+    <div class="cl-serve">
+      <input x-model="model" placeholder="mlx-community/Qwen3.5-9B-OptiQ-4bit"/>
+      <template x-if="phase!=='loading' && phase!=='ready'">
+        <button class="btn btn-primary" @click="startServe()">Start serving</button>
+      </template>
+      <template x-if="phase==='loading'">
+        <button class="btn btn-outline" @click="stopServe()" x-text="'Cancel'"></button>
+      </template>
+      <template x-if="phase==='ready'">
+        <button class="btn btn-outline" @click="stopServe()">Stop</button>
+      </template>
+    </div>
+    <div class="cl-err" x-show="err" x-text="err" style="white-space:pre-wrap"></div>
+
+    <!-- LOADING BANNER: shards paging in across the ring -->
+    <div class="cl-active" x-show="phase==='loading'" style="align-items:center">
+      <div>
+        <div class="cl-active-title">
+          <span class="cl-spinner"></span> Loading shards across the ring…
+        </div>
+        <div class="cl-active-sub">
+          A large model can take a few minutes to page into memory on both Macs.
+          Chat opens automatically when it's ready — you don't need to wait here.
+        </div>
+      </div>
+    </div>
+
+    <!-- ACTIVE BACKEND BANNER: only once the endpoint is actually live -->
+    <div class="cl-active" x-show="phase==='ready'">
+      <div>
+        <div class="cl-active-title">This cluster is your active inference backend</div>
+        <div class="cl-active-sub">Chat and Arena now run across the ring. Nothing else to switch.</div>
+      </div>
+      <a class="btn btn-primary" href="{{ url_for('chat.chat_page') }}">Open Chat →</a>
+    </div>
+  </div>
+</div>
+
+<style>
+.tn-warn{margin-top:6px;font-size:11px;line-height:1.4;color:#8a5a00;background:#fff4e0;
+  border:1px solid #f0d9a8;border-radius:4px;padding:4px 6px}
+@media (prefers-color-scheme: dark){
+  .tn-warn{color:#f0c674;background:rgba(240,198,116,.10);border-color:rgba(240,198,116,.30)}
+}
+.cl-spinner{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
+  border-right-color:transparent;border-radius:50%;animation:cl-spin .7s linear infinite;
+  vertical-align:-1px;margin-right:6px}
+@keyframes cl-spin{to{transform:rotate(360deg)}}
+</style>
+
+<script>
+function clusterPanel(){
+  return {
+    nodes:[], tbUp:false, serving:false, endpoint:null, model:'', loading:false,
+    headroom:6, phase:'idle', err:'', _timer:null,  // phase: idle|loading|ready|error
+    init(){ this.refresh(); this._timer=setInterval(()=>this.refresh(true), 4000); },
+    async refresh(quiet){
+      if(!quiet) this.loading=true;
+      try{
+        const r=await fetch('/api/cluster/peers'); const d=await r.json();
+        this.nodes=d.nodes||[]; this.tbUp=!!d.thunderbolt_up;
+        if(d.headroom_gb) this.headroom=d.headroom_gb;
+        this.serving=!!d.serving; this.endpoint=d.endpoint;
+        if(d.model && !this.model) this.model=d.model;
+        // reconcile phase with server truth (e.g. after a page reload)
+        if(this.phase!=='loading'){
+          if(d.serving) this.phase='ready';
+          else if(this.phase==='ready') this.phase='idle';
+        }
+      }catch(e){}
+      this.loading=false;
+    },
+    get combinedRam(){ let s=this.nodes.reduce((a,n)=>a+(parseInt(n.ram)||0),0); return s?s+' GB':'—'; },
+    // What the cluster can ACTUALLY hold: free memory now, minus what each node
+    // must keep to run the forward. Never installed RAM minus a guess.
+    get combinedSpare(){
+      let s=this.nodes.reduce((a,n)=>a+this.spare(n),0);
+      return s>0 ? s.toFixed(0)+' GB' : '—';
+    },
+    freeOf(n){ return (n.avail===null||n.avail===undefined) ? null : n.avail; },
+    spare(n){ const f=this.freeOf(n); return f===null ? 0 : Math.max(0, f-this.headroom); },
+    ramPct(n){ const f=this.freeOf(n); let r=parseInt(n.ram)||16; return f===null?0:Math.min(100, Math.round(f/r*100)); },
+    sharePct(i){ let w=this.nodes.map(n=>this.spare(n)); let t=w.reduce((a,b)=>a+b,0); return t?Math.round(w[i]/t*100):0; },
+    linkClass(n){ return (n.rtt!==null && n.rtt<=5) ? 'lk-fast' : 'lk-slow'; },
+    rttLabel(n){ return n.rtt===null ? 'unreachable' : (n.link==='Thunderbolt'?'⚡ ':'')+n.rtt+' ms'; },
+    async startServe(){
+      if(!this.model.trim()){ this.err='Enter a model to serve.'; return; }
+      this.err=''; this.phase='loading';
+      try{
+        const r=await fetch('/api/cluster/serve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:this.model})});
+        const d=await r.json();
+        if(!d.ok){ this.err=(d.error||'failed')+(d.log?('\n\n'+d.log):''); this.phase='error'; return; }
+        this.endpoint=d.endpoint;
+        if(d.status==='ready'){ this.serving=true; this.phase='ready'; }
+        else{ this.pollStatus(); }   // still loading shards — poll until live
+      }catch(e){ this.err=String(e); this.phase='error'; }
+    },
+    async pollStatus(){
+      if(this.phase!=='loading') return;
+      try{
+        const r=await fetch('/api/cluster/status'); const d=await r.json();
+        if(d.error){ this.err=(d.error||'serve exited')+(d.log?('\n\n'+d.log):''); this.phase='error'; this.serving=false; return; }
+        if(d.ready){ this.serving=true; this.phase='ready'; return; }
+      }catch(e){}
+      setTimeout(()=>this.pollStatus(), 2500);
+    },
+    async stopServe(){ this.phase='idle'; await fetch('/api/cluster/stop',{method:'POST'}); this.serving=false; this.refresh(); },
+  };
+}
+</script>
+{% endblock %}

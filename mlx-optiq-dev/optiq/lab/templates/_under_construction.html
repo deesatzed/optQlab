@@ -1,0 +1,31 @@
+{% extends "_base.html" %}
+{% block content %}
+<span class="page-eyebrow">OptiQ Lab</span>
+<h1 class="page-title">{{ page_title }}</h1>
+<p class="page-lead">
+  Block A foundation is live. {% if note %}{{ note }}{% else %}This page will be filled in by a later block.{% endif %}
+</p>
+
+<div class="card">
+  <div class="card-title">What's working right now</div>
+  <ul>
+    <li>Flask app boots, base template renders, sidebar shows.</li>
+    <li>SQLite schema initialised at <code>{{ config.OPTIQ_LAB_PATHS.db }}</code>.</li>
+    <li>Background job runner ready (no jobs submitted yet).</li>
+    <li>API URL: <code>{{ api_url }}</code></li>
+  </ul>
+</div>
+
+<div class="card">
+  <div class="card-title">Coming up</div>
+  <ul>
+    <li><strong>Block B</strong> &nbsp;— first-run password setup + login</li>
+    <li><strong>Block C</strong> &nbsp;— live sidebar status, integration snippet copy buttons, recent jobs</li>
+    <li><strong>Block D</strong> &nbsp;— Chat playground</li>
+    <li><strong>Block E</strong> &nbsp;— Quantize wizard (the headliner)</li>
+    <li><strong>Block F</strong> &nbsp;— Hugging Face token settings</li>
+    <li><strong>Block G</strong> &nbsp;— LoRA fine-tune wizard</li>
+    <li><strong>Block H</strong> &nbsp;— Dataset templates</li>
+  </ul>
+</div>
+{% endblock %}

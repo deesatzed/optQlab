@@ -1,0 +1,594 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="serverSettings()" x-init="init()">
+<span class="page-eyebrow">Settings · Server</span>
+<h1 class="page-title">Model server</h1>
+<p class="page-lead">
+  Pick a local OptiQ quant and (optionally) MTP speculation, click Apply, and
+  the Lab swaps the running model without restarting. Switching takes
+  ~5-30 seconds depending on model size.
+</p>
+
+<div class="card">
+  <h2 style="margin-top: 0;">Currently loaded</h2>
+  <table class="tbl" style="font-size: 14px;">
+    <tbody>
+      <tr><td style="color: var(--mute); width: 200px;">Model</td>
+          <td><code x-text="status.model || '— (no model loaded)'"></code></td></tr>
+      <tr><td style="color: var(--mute);">API port</td><td><code>{{ api_port }}</code></td></tr>
+      <tr><td style="color: var(--mute);">Server status</td>
+          <td>
+            <span class="pill"
+                  :class="{'pill-ok': status.api_status === 'ready',
+                           'pill-running': status.api_status === 'starting' || status.api_status === 'stopping',
+                           'pill-err': status.api_status === 'crashed' || status.api_status === 'error',
+                           'pill-idle': status.api_status === 'idle'}"
+                  x-text="status.api_status"></span>
+            <template x-if="status.api_last_error">
+              <span style="color: var(--err); font-size: 12px; margin-left: 8px;" x-text="status.api_last_error"></span>
+            </template>
+          </td></tr>
+      <tr><td style="color: var(--mute);">Spec decoding</td>
+          <td>
+            <template x-if="status.mtp_enabled"><span class="pill pill-ok" x-text="'MTP · depth ' + status.mtp_depth"></span></template>
+            <template x-if="status.drafter_id"><span class="pill pill-ok">drafter · <code x-text="status.drafter_id"></code></span></template>
+            <template x-if="!status.mtp_enabled && !status.drafter_id"><span class="pill pill-idle">off</span></template>
+          </td></tr>
+      <tr><td style="color: var(--mute);">Prompt cache budget</td>
+          <td>
+            <template x-if="status.prompt_cache_bytes">
+              <code x-text="(status.prompt_cache_bytes / (1024**3)).toFixed(2) + ' GB'"></code>
+            </template>
+            <template x-if="!status.prompt_cache_bytes">
+              <code x-text="'{{ default_pc_gb }} GB (default)'"></code>
+            </template>
+          </td></tr>
+      <tr><td style="color: var(--mute);">Sampler</td>
+          <td>
+            <code x-text="activeSamplerSummary()"></code>
+            <span x-show="usingDefaultSampler()" style="color: var(--mute); font-size: 12px; margin-left: 6px;">
+              (from model defaults)
+            </span>
+          </td></tr>
+    </tbody>
+  </table>
+  <template x-if="status.api_status === 'ready' && status.model">
+    <button class="btn btn-ghost" style="margin-top: 12px;" @click="stop()">Stop server</button>
+  </template>
+</div>
+
+<div class="card">
+  <h2 style="margin-top: 0;">Switch model</h2>
+
+  {# Source tabs: Local / Published / Custom #}
+  <div style="display: flex; gap: 6px; margin-bottom: 16px;">
+    <template x-for="t in tabs" :key="t.id">
+      <button class="btn btn-ghost"
+              :style="t.id === source ? 'background: var(--accent-soft); color: var(--accent); border-color: var(--accent-soft);' : ''"
+              @click="source = t.id"
+              x-text="t.label"></button>
+    </template>
+  </div>
+
+  {# Source: local #}
+  <template x-if="source === 'local'">
+    <div>
+      {% if not quants %}
+        <div class="empty" style="margin: 0 0 16px;">
+          <h3>No local OptiQ quants yet</h3>
+          <div>Run a <a href="{{ url_for('quantize.quantize_page') }}">Quantize</a> first, or pick a published one from the tab above.</div>
+        </div>
+      {% else %}
+      <div class="form-row">
+        <label>Local quant <span style="color: var(--mute); font-weight: normal;">(saved under <code>~/.optiq/lab/models/</code>)</span></label>
+        <select x-model="modelInput">
+          <option value="">— select —</option>
+          {% for q in quants %}
+            <option value="{{ q.path }}">
+              {{ q.name }} · {{ q.bits_label }}{% if q.bpw_detail %} ({{ q.bpw_detail }}){% endif %}{% if q.has_mtp %} · MTP{% endif %}{% if q.size_gb %} · {{ q.size_gb }} GB{% endif %}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+    </div>
+  </template>
+
+  {# Source: published #}
+  <template x-if="source === 'published'">
+    <div>
+      <div class="form-row">
+        <label>Published OptiQ quant
+          <button class="btn btn-ghost" style="padding: 1px 8px; font-size: 11px; margin-left: 8px;"
+                  @click="loadPublished(true)" :disabled="loadingPublished">
+            <span x-text="loadingPublished ? 'Refreshing…' : 'Refresh'"></span>
+          </button>
+        </label>
+        <select x-model="modelInput" :disabled="loadingPublished">
+          <option value="">— select —</option>
+          <template x-for="q in published" :key="q.repo_id">
+            <option :value="q.repo_id">
+              <span x-text="q.repo_id + (q.bits ? ' · ' + q.bits : '') + (q.downloads ? '  ·  ' + q.downloads + ' downloads' : '')"></span>
+            </option>
+          </template>
+        </select>
+        <div class="hint" x-show="!loadingPublished && published.length === 0">
+          No published quants found (or HF is unreachable). Try Refresh, or paste an id under Custom.
+        </div>
+      </div>
+    </div>
+  </template>
+
+  {# Source: custom #}
+  <template x-if="source === 'custom'">
+    <div>
+      <div class="form-row">
+        <label>HuggingFace model id or local path</label>
+        <input type="text" x-model="modelInput"
+               placeholder="e.g. Qwen/Qwen3.5-0.8B  or  /abs/path/to/optiq_mixed">
+        <div class="hint">
+          Any model mlx-lm can load: OptiQ quants, plain HF models, or local directories.
+          HF models are cached under <code>~/.cache/huggingface/</code> and downloaded on first use.
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <div class="form-row">
+    <label style="display: inline-flex; gap: 6px;">
+      <input type="checkbox" x-model="mtpOn" :disabled="!!drafterId">
+      Enable MTP speculation
+      <span style="color: var(--mute); font-size: 12px; margin-left: 4px;">(needs an MTP-preserving quant, e.g. Qwen3.5 / Qwen3.6 OptiQ quants)</span>
+    </label>
+  </div>
+  <div class="form-row" x-show="mtpOn">
+    <label>MTP depth</label>
+    <input type="number" min="1" max="8" x-model.number="mtpDepth" style="width: 100px;">
+    <div class="hint">Depth 1 is optimal on Apple Silicon. Deeper hurts because Metal's K-token verify scales near-linearly with K (see <a href="/docs/mtp" target="_blank" rel="noopener">the MTP guide</a>).</div>
+  </div>
+
+  <div class="form-row" x-show="suggestedDrafter() !== null || drafterId">
+    <label style="display: inline-flex; gap: 6px;">
+      Spec drafter (Gemma-4 family)
+      <span style="color: var(--mute); font-size: 12px; margin-left: 4px;">(mutually exclusive with MTP)</span>
+    </label>
+    <input type="text" x-model="drafterId" :disabled="mtpOn"
+           :placeholder="suggestedDrafter() || 'paste an HF -assistant repo id'"
+           style="max-width: 540px; font-family: var(--mono); font-size: 13px;">
+    <div class="hint">
+      Auto-suggested for the selected Gemma-4 target. Loads a separate small
+      <code>-assistant</code> drafter alongside the host model, γ=1 greedy.
+      Leave blank to skip, or type any other HF id to override.
+      See <a href="/docs/mtp" target="_blank" rel="noopener">the MTP guide</a>.
+    </div>
+  </div>
+
+  <div class="form-row">
+    <label>Prompt cache budget (GB)
+      <span style="color: var(--mute); font-weight: normal;">(mlx-lm's per-request KV cache pool)</span>
+    </label>
+    <input type="number" min="0.25" max="128" step="0.25"
+           x-model.number="promptCacheGb" style="width: 120px;">
+    <div class="hint">
+      Caps mlx-lm's LRUPromptCache to prevent long-context OOMs. Higher = more
+      prefix-reuse hits at the cost of RAM; lower = safer on small machines.
+      Default <code>{{ default_pc_gb }} GB</code> (15 % of system RAM).
+    </div>
+  </div>
+
+  <div class="form-row">
+    <label>SSD expert streaming
+      <span style="color: var(--mute); font-weight: normal;">(runs large MoE quants that don't fit in RAM)</span>
+    </label>
+    <select x-model="streamExperts" style="width: 220px;">
+      <option value="auto">Auto (stream only if too big)</option>
+      <option value="on">Always stream MoE experts</option>
+      <option value="off">Off (resident, may OOM)</option>
+    </select>
+    <div class="hint">
+      Streams the active experts of a mixture-of-experts quant from SSD instead
+      of holding every expert resident, so models like Qwen3.6-35B-A3B (21 GB)
+      run on a 24 GB Mac at a few GB. Decode is slower (~3 tok/s); only affects
+      MoE models. <strong>Auto</strong> kicks in only when the model won't fit.
+    </div>
+  </div>
+
+  <div class="form-row">
+    <label>
+      Sampling
+      <span style="color: var(--mute); font-weight: normal;">(pre-filled from the model's <code>generation_config.json</code>; edit or clear any field to override)</span>
+    </label>
+    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; max-width: 640px;">
+      <div>
+        <div style="font-size: 12px; color: var(--mute); margin-bottom: 4px;">temp</div>
+        <input type="number" min="0" max="5" step="0.05"
+               x-model="sampler.temp"
+               :placeholder="placeholderFor('temp')">
+      </div>
+      <div>
+        <div style="font-size: 12px; color: var(--mute); margin-bottom: 4px;">top_p</div>
+        <input type="number" min="0" max="1" step="0.01"
+               x-model="sampler.top_p"
+               :placeholder="placeholderFor('top_p')">
+      </div>
+      <div>
+        <div style="font-size: 12px; color: var(--mute); margin-bottom: 4px;">top_k</div>
+        <input type="number" min="0" max="10000" step="1"
+               x-model="sampler.top_k"
+               :placeholder="placeholderFor('top_k')">
+      </div>
+      <div>
+        <div style="font-size: 12px; color: var(--mute); margin-bottom: 4px;">min_p</div>
+        <input type="number" min="0" max="1" step="0.01"
+               x-model="sampler.min_p"
+               :placeholder="placeholderFor('min_p')">
+      </div>
+    </div>
+    <div class="hint">
+      Model defaults from <code>generation_config.json</code> apply for blank fields. Use <code>temp=0</code> for greedy / deterministic output (gives the largest MTP speedup).
+    </div>
+  </div>
+
+  <div class="form-row">
+    <label>
+      LoRA adapters
+      <span style="color: var(--mute); font-weight: normal;">
+        mount one or more trained adapters on top of the base model
+      </span>
+    </label>
+    <div class="hint" style="margin-bottom: 8px;">
+      Pick from local adapters discovered under <code>models/</code>, paste a path
+      from elsewhere, or add multiple. One adapter routes through mlx-lm's
+      classic <code>--adapter-path</code> boot; two or more activate OptiQ's
+      mounted-LoRA mode where the base model stays loaded and clients pick
+      an adapter per request via the <code>adapters</code> field in the body
+      (adapter name = the directory's basename). Switching is instant: one base in RAM, plus about 30 MB per extra adapter, gated by a
+      <code>ContextVar</code> in the forward pass.
+    </div>
+
+    <template x-if="discoveredAdapters.length > 0">
+      <div style="margin-bottom: 10px;">
+        <div style="font-size: 12px; color: var(--mute); margin-bottom: 6px;">
+          Found in <code>~/.optiq/lab/models</code> (click to add):
+        </div>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+          <template x-for="a in discoveredAdapters" :key="a.path">
+            <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 12.5px;"
+                    :disabled="adapters.includes(a.path)"
+                    @click="addAdapter(a.path)">
+              <span x-text="a.name"></span>
+            </button>
+          </template>
+        </div>
+      </div>
+    </template>
+
+    <div style="display: flex; gap: 6px; margin-bottom: 10px;">
+      <input type="text" x-model="adapterInput"
+             placeholder="/absolute/path/to/adapter-dir or basename in models/"
+             style="flex: 1;">
+      <button class="btn btn-ghost"
+              :disabled="!adapterInput.trim()"
+              @click="addAdapter(adapterInput.trim()); adapterInput = '';">
+        Add
+      </button>
+    </div>
+
+    <template x-if="adapters.length > 0">
+      <div>
+        <div style="font-size: 12px; color: var(--mute); margin-bottom: 6px;">
+          Will be mounted at next Apply (<span x-text="adapters.length"></span>):
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <template x-for="(p, i) in adapters" :key="p">
+            <div style="display: flex; align-items: center; gap: 8px;
+                        background: var(--paper-3); padding: 4px 8px; border-radius: 6px;">
+              <span class="pill pill-ok" style="font-family: var(--mono); font-size: 11px;"
+                    x-text="adapterNameFor(p)"></span>
+              <code style="font-size: 12px; color: var(--mute); flex: 1;
+                           overflow: hidden; text-overflow: ellipsis;
+                           white-space: nowrap;" x-text="p"></code>
+              <button class="btn btn-ghost" style="padding: 2px 8px; font-size: 11px;"
+                      @click="removeAdapter(i)">remove</button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </template>
+
+    <template x-if="adapters.length === 0">
+      <div class="hint">No adapters; the base model serves requests directly.</div>
+    </template>
+
+    <template x-if="status.adapters && status.adapters.length > 0">
+      <div style="margin-top: 12px; font-size: 12.5px;">
+        <strong>Currently mounted on the running server:</strong>
+        <ul style="margin: 4px 0 0 18px; padding: 0;">
+          <template x-for="p in (status.adapters || [])" :key="p">
+            <li style="margin: 2px 0;">
+              <span class="pill pill-ok" style="font-family: var(--mono);"
+                    x-text="adapterNameFor(p)"></span>
+              <code style="font-size: 12px; color: var(--mute);" x-text="p"></code>
+            </li>
+          </template>
+        </ul>
+        <div class="hint" style="margin-top: 6px;">
+          Switch per request with
+          <code>{"adapters": "&lt;name&gt;"}</code> in the chat-completions body.
+          The Chat surface picks one via the dropdown above the message input.
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <div style="display: flex; gap: 8px; align-items: center;">
+    <button class="btn"
+            :disabled="!modelInput || applying || status.api_status === 'starting' || status.api_status === 'stopping'"
+            @click="apply()">
+      <span x-text="applying ? 'Applying…' : (status.model ? 'Apply (restart server)' : 'Start server')"></span>
+    </button>
+    <template x-if="lastResult && !lastResult.ok">
+      <span class="flash flash-err" style="padding: 4px 10px;" x-text="lastResult.error"></span>
+    </template>
+    <template x-if="lastResult && lastResult.ok && status.api_status !== 'ready'">
+      <span style="color: var(--mute); font-size: 13px;">Loading model… status will update when ready.</span>
+    </template>
+  </div>
+</div>
+</div>
+
+<script>
+function serverSettings() {
+  return {
+    status: {api_status: 'idle', model: null, mtp_enabled: false, mtp_depth: 0, drafter_id: null, api_last_error: null, sampler: null, sampler_defaults: {}, adapters: []},
+    tabs: [
+      {id: 'local',     label: 'Local'},
+      {id: 'published', label: 'Published (mlx-community)'},
+      {id: 'custom',    label: 'Any HF id / local path'},
+    ],
+    source: 'local',
+    modelInput: '',
+    published: [],
+    loadingPublished: false,
+    mtpOn: {{ 'true' if mtp_on else 'false' }},
+    mtpDepth: {{ mtp_depth or 1 }},
+    drafterId: {{ (drafter_id or "") | tojson }},
+    streamExperts: localStorage.getItem('optiq.streamExperts') || 'auto',
+    knownDrafters: {{ known_drafters | tojson }},
+    drafterUserEdited: false,
+    promptCacheGb: parseFloat(localStorage.getItem('optiq.promptCacheGb') || '{{ default_pc_gb }}'),
+    sampler: JSON.parse(localStorage.getItem('optiq.sampler') || '{"temp":"","top_p":"","top_k":"","min_p":""}'),
+    samplerDefaultsApplied: false,
+    // LoRA adapters that will be mounted on the next Apply.
+    adapters: JSON.parse(localStorage.getItem('optiq.adapters') || '[]'),
+    adapterInput: '',
+    discoveredAdapters: [],
+    applying: false,
+    lastResult: null,
+
+    init() {
+      // Clear the model input when the user changes tab so we don't
+      // accidentally submit a value from a different source.
+      this.$watch('source', () => {
+        this.modelInput = '';
+        if (this.source === 'published' && this.published.length === 0) {
+          this.loadPublished();
+        }
+      });
+      // Auto-suggest a drafter whenever the model selection changes,
+      // unless the user has manually typed/cleared the drafter field.
+      // Also kick off a sampler-defaults preview fetch so the form
+      // shows the model's recommended sampling without waiting for
+      // the model to actually load.
+      this.$watch('modelInput', () => {
+        if (!this.drafterUserEdited) {
+          const s = this.suggestedDrafter();
+          this.drafterId = s || '';
+        }
+        this.previewSamplerDefaults();
+      });
+      // Remember when the user edits the drafter field so we stop
+      // overwriting their value on subsequent model changes.
+      this.$watch('drafterId', (v, old) => {
+        // Only treat as "user edited" if the change happened outside
+        // our own auto-suggest path. Compare against the suggestion.
+        if (v !== this.suggestedDrafter()) this.drafterUserEdited = true;
+      });
+      this.poll();
+      this.loadDiscoveredAdapters();
+    },
+
+    async loadDiscoveredAdapters() {
+      try {
+        const r = await fetch('/api/server/adapters', {credentials: 'same-origin'});
+        if (r.ok) {
+          const data = await r.json();
+          this.discoveredAdapters = data.adapters || [];
+        }
+      } catch (e) {}
+    },
+
+    addAdapter(p) {
+      const path = (p || '').trim();
+      if (!path) return;
+      if (this.adapters.includes(path)) return;
+      this.adapters.push(path);
+      localStorage.setItem('optiq.adapters', JSON.stringify(this.adapters));
+    },
+
+    removeAdapter(idx) {
+      this.adapters.splice(idx, 1);
+      localStorage.setItem('optiq.adapters', JSON.stringify(this.adapters));
+    },
+
+    adapterNameFor(p) {
+      if (!p) return '';
+      const parts = p.replace(/\/+$/, '').split('/');
+      return parts[parts.length - 1] || p;
+    },
+
+    // Pull recommended sampling for the currently-selected model from
+    // its generation_config.json (cache hit if local, single small file
+    // fetch from HF otherwise). Pre-fills any blank sampler input with
+    // the value so the user sees what will apply if they don't override.
+    async previewSamplerDefaults() {
+      const m = (this.modelInput || '').trim();
+      if (!m) return;
+      try {
+        const r = await fetch('/api/server/inspect-sampling', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({model: m}),
+          credentials: 'same-origin',
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (!data.ok) return;
+        const d = data.defaults || {};
+        // Surface the preview as the placeholder so the user sees what
+        // applies even if they keep the field blank, AND also pre-fill
+        // any blank field so the value is visible (and editable).
+        if (!this.status.sampler_defaults || !Object.keys(this.status.sampler_defaults).length) {
+          // Mirror onto status so placeholderFor() and the status row
+          // pick up the preview before the model actually loads.
+          this.status.sampler_defaults = d;
+        }
+        for (const k of ['temp', 'top_p', 'top_k', 'min_p']) {
+          if (this.sampler[k] === '' && d[k] !== undefined && d[k] !== null) {
+            this.sampler[k] = String(d[k]);
+          }
+        }
+      } catch (e) {}
+    },
+
+    // Map the current model selection to a suggested -assistant drafter id,
+    // or null if the model isn't a known Gemma-4 target.
+    suggestedDrafter() {
+      const m = (this.modelInput || '').toLowerCase();
+      if (!m) return null;
+      for (const [prefix, hfId] of Object.entries(this.knownDrafters)) {
+        // Match against the basename so /path/to/gemma-4-e4b-it-OptiQ-4bit also works.
+        const last = m.replace(/\/+$/, '').split('/').pop();
+        if (last.startsWith(prefix)) return hfId;
+        // Also match full HF ids like mlx-community/gemma-4-e4b-it-OptiQ-4bit
+        if (m.includes('/' + prefix) || m.includes('/' + prefix.replace(/-/g, '_'))) return hfId;
+      }
+      return null;
+    },
+
+    async loadPublished(force = false) {
+      this.loadingPublished = true;
+      try {
+        const r = await fetch('/api/server/published' + (force ? '?refresh=1' : ''),
+                              {credentials: 'same-origin'});
+        if (r.ok) {
+          const data = await r.json();
+          this.published = (data.quants || []);
+        }
+      } catch (e) {}
+      this.loadingPublished = false;
+    },
+
+    async poll() {
+      try {
+        const r = await fetch('/api/status', {credentials: 'same-origin'});
+        if (r.ok) {
+          this.status = await r.json();
+          // First time we receive sampler defaults from the model,
+          // pre-fill any blank input with the recommended value so the
+          // user can see what's being applied. They can still edit any
+          // field or clear it back to blank.
+          if (!this.samplerDefaultsApplied) {
+            const d = this.status.sampler_defaults || {};
+            if (Object.keys(d).length) {
+              for (const k of ['temp', 'top_p', 'top_k', 'min_p']) {
+                if (this.sampler[k] === '' && d[k] !== undefined && d[k] !== null) {
+                  this.sampler[k] = String(d[k]);
+                }
+              }
+              this.samplerDefaultsApplied = true;
+            }
+          }
+        }
+      } catch (e) {}
+      setTimeout(() => this.poll(), 2000);
+    },
+
+    placeholderFor(key) {
+      // Show the model's recommended default as the placeholder so
+      // users see what will apply if they leave the field blank.
+      const d = (this.status && this.status.sampler_defaults) || {};
+      if (d[key] === undefined || d[key] === null) return '';
+      return String(d[key]);
+    },
+
+    activeSamplerSummary() {
+      // Compose the line shown in the "Sampler" status row. Reflects
+      // either the user-set override (from supervisor state) or the
+      // model defaults; for blank user fields, the model default fills in.
+      const active = this.status.sampler || {};
+      const defaults = this.status.sampler_defaults || {};
+      const parts = [];
+      for (const k of ['temp', 'top_p', 'top_k', 'min_p']) {
+        const v = active[k] !== undefined && active[k] !== null
+          ? active[k]
+          : defaults[k];
+        if (v !== undefined && v !== null) parts.push(k + '=' + v);
+      }
+      return parts.length ? parts.join(' · ') : '—';
+    },
+
+    usingDefaultSampler() {
+      const s = this.status.sampler;
+      return !s || Object.keys(s).length === 0;
+    },
+
+    async apply() {
+      this.applying = true;
+      this.lastResult = null;
+      try {
+        localStorage.setItem('optiq.promptCacheGb', String(this.promptCacheGb));
+        localStorage.setItem('optiq.streamExperts', this.streamExperts);
+        localStorage.setItem('optiq.sampler', JSON.stringify(this.sampler));
+        const pcBytes = Math.round(this.promptCacheGb * 1024**3);
+        // Build sampler payload from non-blank fields. mlx_lm.server
+        // reads top_k as int; everything else as float.
+        const samplerPayload = {};
+        for (const k of ['temp', 'top_p', 'top_k', 'min_p']) {
+          const v = this.sampler[k];
+          if (v !== '' && v !== null && v !== undefined) {
+            samplerPayload[k] = (k === 'top_k') ? parseInt(v, 10) : parseFloat(v);
+          }
+        }
+        const r = await fetch('/api/server/apply', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            model: this.modelInput.trim(),
+            mtp: this.mtpOn,
+            mtp_depth: this.mtpDepth,
+            drafter_id: this.drafterId || null,
+            prompt_cache_bytes: pcBytes,
+            sampler: samplerPayload,
+            adapters: this.adapters,
+            stream_experts: this.streamExperts,
+          }),
+          credentials: 'same-origin',
+        });
+        this.lastResult = await r.json();
+      } catch (e) {
+        this.lastResult = {ok: false, error: e.message};
+      }
+      this.applying = false;
+    },
+
+    async stop() {
+      if (!confirm('Stop the model server? Chat will be unavailable until you start another model.')) return;
+      await fetch('/api/server/stop', {
+        method: 'POST', credentials: 'same-origin',
+      });
+    },
+  };
+}
+</script>
+{% endblock %}

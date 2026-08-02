@@ -1,0 +1,97 @@
+{% extends "_base.html" %}
+{% block content %}
+<span class="page-eyebrow">Settings · Hugging Face</span>
+<h1 class="page-title">Hugging Face token</h1>
+<p class="page-lead">
+  Save a write-scope HF token to push OptiQ quants, LoRA adapters, and datasets
+  to the Hub straight from the workflows. The token is encrypted at rest with a
+  key derived from your Lab password.
+</p>
+
+<div class="card" x-data="hfAdd()">
+  <h2 style="margin-top: 0;">Add a token</h2>
+  <p style="color: var(--mute); font-size: 13px; margin-bottom: 16px;">
+    Generate one at <a href="https://huggingface.co/settings/tokens" target="_blank">huggingface.co/settings/tokens</a>
+    with the <strong>Write</strong> role.
+  </p>
+  <form method="post" action="{{ url_for('settings.hf_add') }}">
+    <div class="form-row">
+      <label>Name <span style="color: var(--mute); font-weight: normal;">(any label, just for your reference)</span></label>
+      <input type="text" name="name" x-model="name" placeholder="e.g. my-personal-write" required>
+    </div>
+    <div class="form-row">
+      <label>Token</label>
+      <input type="password" name="token" x-model="token" placeholder="hf_..." required>
+      <button type="button" class="btn btn-ghost"
+              style="margin-top: 8px; font-size: 13px;"
+              :disabled="!token"
+              @click="validate()">Test token</button>
+      <template x-if="validation">
+        <div class="hint" :class="validation.ok ? 'flash-ok' : 'flash-err'"
+             style="padding: 6px 10px; margin-top: 8px;">
+          <template x-if="validation.ok">
+            <span>Valid as <strong x-text="validation.username"></strong>
+              <template x-if="validation.orgs.length">
+                <span> (orgs: <span x-text="validation.orgs.join(', ')"></span>)</span>
+              </template>
+            </span>
+          </template>
+          <template x-if="!validation.ok">
+            <span x-text="'Invalid: ' + validation.error"></span>
+          </template>
+        </div>
+      </template>
+    </div>
+    <div class="form-row">
+      <label>Lab password <span style="color: var(--mute); font-weight: normal;">(needed to encrypt the token)</span></label>
+      <input type="password" name="password" required>
+    </div>
+    <button type="submit" class="btn">Save token</button>
+  </form>
+</div>
+
+{% if tokens %}
+<h2>Saved tokens</h2>
+{% for t in tokens %}
+<div class="card" style="display: flex; align-items: center; justify-content: space-between;">
+  <div>
+    <div style="font-family: var(--display); font-weight: 500; font-size: 16px;">{{ t.name }}</div>
+    <div style="color: var(--mute); font-size: 13px;">
+      {{ t.username or 'unknown user' }}
+      {% if t.orgs %} · orgs: {{ t.orgs|join(', ') }}{% endif %}
+      {% if t.scope %} · {{ t.scope }}{% endif %}
+       · added {{ t.created_at[:10] }}
+    </div>
+  </div>
+  <form method="post" action="{{ url_for('settings.hf_delete', token_id=t.id) }}"
+        onsubmit="return confirm('Delete token {{ t.name }}?');">
+    <button type="submit" class="btn btn-ghost">Delete</button>
+  </form>
+</div>
+{% endfor %}
+{% else %}
+<div class="empty">
+  <h3>No tokens saved yet</h3>
+  <div>Add one above and the Quantize / Fine-tune / Dataset workflows will offer a Push to HF button.</div>
+</div>
+{% endif %}
+
+<script>
+function hfAdd() {
+  return {
+    name: '', token: '', validation: null,
+    async validate() {
+      this.validation = null;
+      const r = await fetch('{{ url_for("settings.hf_validate") }}', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({token: this.token}),
+        credentials: 'same-origin',
+      });
+      const data = await r.json();
+      this.validation = data;
+    }
+  };
+}
+</script>
+{% endblock %}

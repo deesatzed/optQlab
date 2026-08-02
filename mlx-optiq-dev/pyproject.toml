@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-optiq"
+version = "0.4.7+phase0dev"
+description = "Editable worktree for OptiQ Lab Phase 0 spine (bootstrapped from pip 0.4.7)"
+requires-python = ">=3.11"
+dependencies = [
+  "mlx>=0.20",
+  "mlx-lm>=0.31.3",
+  "transformers<5.13",
+  "numpy",
+  "scipy",
+  "huggingface-hub",
+  "lm-format-enforcer>=0.10",
+  "pillow>=10",
+  "textual>=0.60",
+  "openai>=1.0",
+  "ddgs>=9.0",
+  "html2text>=2024.0",
+  "flask",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov"]
+
+[project.scripts]
+optiq = "optiq.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["optiq*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

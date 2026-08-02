@@ -1,0 +1,1729 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="chatApp()" x-init="init()" style="max-width: 1180px;"
+     :style="{ maxWidth: artifact ? '1560px' : '1180px' }"
+     x-effect="document.body.classList.toggle('artifact-open', !!artifact)">
+  <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 16px;">
+    <div>
+      <span class="page-eyebrow">Workflow · chat</span>
+      <h1 class="page-title" style="margin-bottom: 4px;">Chat</h1>
+      <p class="page-lead" style="margin-bottom: 12px;">Talk to the loaded model. Tools (web search, Python, terminal) run locally in a sandbox.</p>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <button class="btn btn-ghost" @click="resetThread()">New chat</button>
+      <button class="btn" @click="save()" :disabled="messages.length === 0">Save</button>
+    </div>
+  </div>
+
+  <div style="display: grid; gap: 24px; grid-template-columns: minmax(0, 1fr) 260px;"
+       :style="{ gridTemplateColumns: artifact
+                   ? 'minmax(0, 1fr) minmax(520px, 44%)'
+                   : 'minmax(0, 1fr) 260px' }">
+    <div style="min-width: 0;">
+      <details class="card chat-settings">
+        <summary>
+          <span>Model &amp; params</span>
+          <span class="chat-settings-summary">
+            <span class="chip" x-text="model || 'default model'"></span>
+            <span class="chip" x-text="'T=' + temperature.toFixed(1)"></span>
+            <span class="chip" x-text="'max=' + maxTokens"></span>
+            <span class="chip" :class="toolsEnabled ? 'chip-on' : 'chip-off'" x-text="toolsEnabled ? 'tools on' : 'tools off'"></span>
+            <span class="chip" :class="enableThinking === 'on' ? 'chip-on' : 'chip-off'" x-text="'reason: ' + enableThinking"></span>
+            <template x-if="selectedAdapter">
+              <span class="chip chip-on" style="font-family: var(--mono);"
+                    x-text="'adapter: ' + adapterNameFor(selectedAdapter)"></span>
+            </template>
+          </span>
+        </summary>
+        <div class="chat-settings-grid">
+          <div class="form-row" style="margin: 0;">
+            <label>Model</label>
+            <input type="text" x-model="model" list="model-options"
+                   placeholder="(use API default)">
+            <datalist id="model-options">
+              {% for m in model_picker or [] %}
+                <option value="{{ m.path }}" label="{{ m.name }} · {{ m.source }}"></option>
+              {% endfor %}
+            </datalist>
+          </div>
+          <div class="form-row" style="margin: 0;">
+            <label>Model source</label>
+            <select x-model.boolean="showCloud">
+              <option :value="false">local · optiq serve</option>
+              <option :value="true">cloud API · OpenRouter, OpenAI-compatible</option>
+            </select>
+          </div>
+          <template x-if="showCloud">
+            <div style="grid-column: 1 / -1; display: grid; gap: 10px;">
+              <div class="form-row" style="margin: 0;">
+                <label>API base URL</label>
+                <input type="text" x-model.trim="cloudBaseUrl"
+                       placeholder="https://openrouter.ai/api/v1" autocomplete="off">
+              </div>
+              <div class="form-row" style="margin: 0;">
+                <label>API key</label>
+                <input type="password" x-model.trim="cloudApiKey"
+                       placeholder="sk-or-v1-…" autocomplete="off" spellcheck="false">
+              </div>
+              <p style="grid-column: 1 / -1; margin: 0; font-size: 0.85em; opacity: 0.72;">
+                Set <strong>Model</strong> above to the provider's id (e.g.
+                <code>z-ai/glm-5.2</code>). Your key stays in this browser and is
+                sent only to your local OptiQ Lab, which proxies the request —
+                chat and tool calls work the same as with a local model.
+              </p>
+            </div>
+          </template>
+          <div class="form-row" style="margin: 0;">
+            <label>Temperature</label>
+            <input type="number" step="0.1" min="0" max="2" x-model.number="temperature">
+          </div>
+          <div class="form-row" style="margin: 0;">
+            <label>Max tokens</label>
+            <input type="number" min="1" max="32768" x-model.number="maxTokens">
+          </div>
+          <div class="form-row" style="margin: 0;">
+            <label>Reasoning</label>
+            <select x-model="enableThinking">
+              <option value="off">off (recommended for small models)</option>
+              <option value="on">on</option>
+              <option value="auto">auto (model default)</option>
+            </select>
+          </div>
+          <div class="form-row" style="margin: 0;">
+            <label>Tools</label>
+            <select x-model.boolean="toolsEnabled">
+              <option :value="true">enabled (web_search, python, terminal)</option>
+              <option :value="false">disabled (plain chat)</option>
+            </select>
+          </div>
+          <div class="form-row" style="margin: 0;">
+            <label>JSON mode</label>
+            <select x-model="jsonMode">
+              <option value="off">off</option>
+              <option value="object">on · any valid JSON</option>
+              <option value="schema">on · match schema</option>
+            </select>
+          </div>
+          <div class="form-row" style="margin: 0;" x-show="jsonMode === 'schema'">
+            <label>JSON schema</label>
+            <textarea x-model="jsonSchema" rows="5" spellcheck="false"
+              style="font-family: var(--mono); font-size: 12px;"
+              placeholder='{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}'></textarea>
+          </div>
+          <div class="hint" x-show="jsonMode !== 'off'"
+               style="font-size: 11px; color: var(--mute); margin: -4px 0 0;">
+            Constrains the decode to valid JSON via lm-format-enforcer. Tools are off while JSON mode is on.
+          </div>
+          <div class="form-row" style="margin: 0;">
+            <label>Sandbox</label>
+            <input type="text" :value="sandboxKind || 'detecting…'" disabled style="font-family: var(--mono); font-size: 12px;">
+          </div>
+          <div class="form-row" style="margin: 0;"
+               x-show="mountedAdapters.length > 0">
+            <label>LoRA adapter
+              <span style="color: var(--mute); font-weight: normal;"
+                    x-text="mountedAdapters.length > 1
+                            ? ('— ' + mountedAdapters.length + ' mounted, switch per message')
+                            : '— 1 mounted'"></span>
+            </label>
+            <select x-model="selectedAdapter">
+              <option value="">base model (no adapter)</option>
+              <template x-for="a in mountedAdapters" :key="a">
+                <option :value="a" x-text="adapterNameFor(a)"></option>
+              </template>
+            </select>
+          </div>
+        </div>
+      </details>
+
+      <div class="thread-card">
+        <div id="thread" class="thread">
+          <template x-if="!modelServed && !_cloudActive() && messages.length === 0">
+            <div class="thread-empty">
+              <h3>No model is being served</h3>
+              <div class="thread-empty-sub">
+                Load a model before chatting:
+                <a href="{{ url_for('settings.server') }}">Server</a> for one Mac, or
+                <a href="{{ url_for('cluster.cluster_page') }}">Cluster</a> to shard a large
+                model across Macs over Thunderbolt. Or use a
+                <strong>cloud API</strong> above.
+              </div>
+            </div>
+          </template>
+          <template x-if="(modelServed || _cloudActive()) && messages.length === 0">
+            <div class="thread-empty">
+              <h3>Start a conversation</h3>
+              <div class="thread-empty-sub">
+                Try <button class="chip-btn" @click="quick('What is 12345 * 67890? Use the python tool.')">a calculation</button>,
+                <button class="chip-btn" @click="quick('Search for the latest MLX release notes and summarize them.')">a web search</button>, or
+                <button class="chip-btn" @click="quick('List the files in this directory using the terminal tool.')">a shell command</button>.
+              </div>
+            </div>
+          </template>
+          <template x-for="(g, gi) in displayItems" :key="gi">
+            <div>
+              <template x-if="g.type === 'message'">
+                <div class="msg" :class="'msg-' + g.m.role">
+                  <div class="msg-role">
+                    <span x-text="g.m.role"></span>
+                    <span class="tok-rate" x-show="g.m.role === 'assistant' && g.m.tok_per_sec" x-text="g.m.tok_per_sec + ' tok/s'"></span>
+                  </div>
+                  <template x-if="g.m.research">
+                    <div class="research-card">
+                      <div class="research-head">
+                        <span class="research-glyph" :class="!g.m.research.done && !g.m.research.error ? 'spin' : ''">🔬</span>
+                        <span class="research-phase"
+                              x-text="g.m.research.error ? ('stopped — ' + g.m.research.error) : g.m.research.phaseLabel"></span>
+                      </div>
+                      <template x-if="g.m.research.plan">
+                        <details class="research-block">
+                          <summary>Research plan</summary>
+                          <div class="research-plan" x-html="renderBody(g.m.research.plan)"></div>
+                        </details>
+                      </template>
+                      <template x-if="g.m.research.sources.length">
+                        <details class="research-block" :open="!g.m.research.done">
+                          <summary x-text="g.m.research.sources.length + ' source' + (g.m.research.sources.length === 1 ? '' : 's') + ' read'"></summary>
+                          <template x-for="(s, si) in g.m.research.sources" :key="si">
+                            <div class="research-src">
+                              <span class="research-src-n" x-text="'[' + (si + 1) + ']'"></span>
+                              <a :href="s.url" target="_blank" rel="noopener" x-text="s.title || s.url"></a>
+                            </div>
+                          </template>
+                        </details>
+                      </template>
+                      <div class="research-stats">
+                        <span x-show="g.m.research.searches.length"
+                              x-text="g.m.research.searches.length + ' web search' + (g.m.research.searches.length === 1 ? '' : 'es')"></span>
+                        <span x-show="g.m.research.repaired"
+                              x-text="' · ' + g.m.research.repaired + ' citation' + (g.m.research.repaired === 1 ? '' : 's') + ' repaired'"></span>
+                      </div>
+                      <template x-if="g.m.research.done && g.m.research.report_html">
+                        <button class="artifact-card" type="button" @click="openArtifact(g.m.research.report_html, g.m.research.report_md)"
+                                :class="artifact === g.m.research.report_html ? 'artifact-card-open' : ''">
+                          <span class="artifact-glyph">▶</span>
+                          <span class="artifact-meta">
+                            <span class="artifact-title">Research report</span>
+                            <span class="artifact-sub">cited Markdown report · opens in the side panel</span>
+                          </span>
+                          <span class="artifact-run" x-text="artifact === g.m.research.report_html ? 'open' : 'Open'"></span>
+                        </button>
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="messageImages(g.m.content).length">
+                    <div class="msg-images">
+                      <template x-for="(src, ii) in messageImages(g.m.content)" :key="ii">
+                        <img :src="src" class="msg-image" alt="attached image">
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="g.m.content">
+                    <div class="msg-body" x-html="renderBody(g.m.content)"></div>
+                  </template>
+                  <template x-if="g.m.role === 'assistant'">
+                    <template x-for="(art, ai) in htmlArtifacts(g.m.content)" :key="ai">
+                      <button class="artifact-card" type="button" @click="openArtifact(art)"
+                              :class="artifact === art ? 'artifact-card-open' : ''">
+                        <span class="artifact-glyph">▶</span>
+                        <span class="artifact-meta">
+                          <span class="artifact-title" x-text="artifactTitle(art)"></span>
+                          <span class="artifact-sub">HTML page · runs sandboxed in the side panel</span>
+                        </span>
+                        <span class="artifact-run" x-text="artifact === art ? 'running' : 'Run'"></span>
+                      </button>
+                    </template>
+                  </template>
+                  <template x-if="g.m.sources && g.m.sources.length">
+                    <details class="msg-sources" open>
+                      <summary x-text="g.m.sources.length + ' source' + (g.m.sources.length > 1 ? 's' : '') + ' cited'"></summary>
+                      <template x-for="s in g.m.sources" :key="s.n">
+                        <div class="src-item">
+                          <span class="src-n" x-text="'[' + s.n + ']'"></span>
+                          <span class="src-file" x-text="s.source"></span>
+                          <span class="src-prev" x-text="s.preview"></span>
+                        </div>
+                      </template>
+                    </details>
+                  </template>
+                  <template x-if="g.m.role === 'assistant' && !g.m.content && g.m.reasoning">
+                    <div class="msg-body" style="color: var(--mute); font-style: italic; font-size: 13px;">
+                      Model spent all tokens reasoning and didn't reach the answer.
+                      Open <strong>Model &amp; params</strong> above and set
+                      <strong>Reasoning → off</strong>, or raise <strong>max_tokens</strong>.
+                    </div>
+                  </template>
+                  <template x-if="g.m.reasoning">
+                    <details class="msg-reasoning" :open="!g.m.content">
+                      <summary x-text="g.m.content ? 'reasoning' : 'reasoning (only output)'"></summary>
+                      <pre x-text="g.m.reasoning"></pre>
+                    </details>
+                  </template>
+                </div>
+              </template>
+              <template x-if="g.type === 'tool-group'">
+                <div class="msg msg-tool-group">
+                  <template x-if="g.cards.length > 1">
+                    <details class="tool-group-wrap" :open="g.expanded">
+                      <summary>
+                        <span class="tool-group-count" x-text="g.cards.length + ' tool calls'"></span>
+                        <span class="tool-group-summary">
+                          <template x-for="c in g.cards" :key="c.id"><span class="tool-chip" :class="'tool-' + c.name"><span class="tool-icon" x-text="toolIcon(c.name)"></span><span x-text="c.name"></span></span></template>
+                        </span>
+                      </summary>
+                      <template x-for="c in g.cards" :key="c.id">
+                        <div class="tool-card" :class="'tool-' + c.name">
+                          <div class="tool-card-head">
+                            <span class="tool-icon" x-text="toolIcon(c.name)"></span>
+                            <span class="tool-name" x-text="c.name"></span>
+                            <template x-if="c.healed">
+                              <span class="chip chip-warn" title="Model emitted a malformed tool call; we healed it">healed</span>
+                            </template>
+                            <template x-if="c.duplicate">
+                              <span class="chip chip-warn" title="Duplicate call; skipped re-execution">dedup</span>
+                            </template>
+                            <template x-if="c.retry_exhausted">
+                              <span class="chip chip-err" title="This call kept failing; self-healing retry budget spent, not re-run">retry limit</span>
+                            </template>
+                            <template x-if="c.errored">
+                              <span class="chip chip-err" title="Tool returned an error">error</span>
+                            </template>
+                            <span class="tool-elapsed" x-text="c.elapsed_sec != null ? c.elapsed_sec.toFixed(2) + 's' : ''"></span>
+                          </div>
+                          <details class="tool-args">
+                            <summary>arguments</summary>
+                            <pre x-text="JSON.stringify(c.arguments, null, 2)"></pre>
+                          </details>
+                          <template x-if="c.result != null">
+                            <details class="tool-result" :open="g.expanded">
+                              <summary>output</summary>
+                              <pre x-text="c.result"></pre>
+                            </details>
+                          </template>
+                          <template x-if="c.result == null">
+                            <div class="tool-running">running…</div>
+                          </template>
+                          <template x-if="c.images && c.images.length">
+                            <div class="tool-images">
+                              <template x-for="img in c.images" :key="img.filename">
+                                <figure class="tool-image">
+                                  <img :src="'data:' + img.mime + ';base64,' + img.data_b64"
+                                       :alt="img.filename">
+                                  <figcaption x-text="img.filename"></figcaption>
+                                </figure>
+                              </template>
+                            </div>
+                          </template>
+                        </div>
+                      </template>
+                    </details>
+                  </template>
+                  <template x-if="g.cards.length === 1">
+                    <template x-for="c in g.cards" :key="c.id">
+                      <div class="tool-card" :class="'tool-' + c.name">
+                        <div class="tool-card-head">
+                          <span class="tool-icon" x-text="toolIcon(c.name)"></span>
+                          <span class="tool-name" x-text="c.name"></span>
+                          <template x-if="c.healed">
+                            <span class="chip chip-warn" title="Model emitted a malformed tool call; we healed it">healed</span>
+                          </template>
+                          <template x-if="c.duplicate">
+                            <span class="chip chip-warn" title="Duplicate call; skipped re-execution">dedup</span>
+                          </template>
+                          <template x-if="c.errored">
+                            <span class="chip chip-err" title="Tool returned an error">error</span>
+                          </template>
+                          <span class="tool-elapsed" x-text="c.elapsed_sec != null ? c.elapsed_sec.toFixed(2) + 's' : ''"></span>
+                        </div>
+                        <details class="tool-args">
+                          <summary>arguments</summary>
+                          <pre x-text="JSON.stringify(c.arguments, null, 2)"></pre>
+                        </details>
+                        <template x-if="c.result != null">
+                          <details class="tool-result" :open="g.expanded">
+                            <summary>output</summary>
+                            <pre x-text="c.result"></pre>
+                          </details>
+                        </template>
+                        <template x-if="c.result == null">
+                          <div class="tool-running">running…</div>
+                        </template>
+                        <template x-if="c.images && c.images.length">
+                          <div class="tool-images">
+                            <template x-for="img in c.images" :key="img.filename">
+                              <figure class="tool-image">
+                                <img :src="'data:' + img.mime + ';base64,' + img.data_b64"
+                                     :alt="img.filename">
+                                <figcaption x-text="img.filename"></figcaption>
+                              </figure>
+                            </template>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+          <template x-if="streaming">
+            <div class="msg msg-assistant">
+              <div class="msg-role">
+                assistant
+                <span class="thinking-dot"></span>
+                <span class="tok-rate" x-show="tokPerSec" x-text="tokPerSec + ' tok/s'"></span>
+              </div>
+              <template x-if="partial">
+                <div class="msg-body" x-html="renderBody(partial)"></div>
+              </template>
+              <template x-if="!partial && lastEventLabel">
+                <div class="msg-body" style="color: var(--mute); font-style: italic;" x-text="lastEventLabel"></div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <form @submit.prevent="send()" class="composer">
+          <div class="composer-row">
+            <textarea x-model="input"
+                      :disabled="streaming"
+                      @keydown.enter.prevent="if (!$event.shiftKey) send()"
+                      placeholder="Message the model. ⏎ to send, ⇧⏎ for newline."
+                      rows="1"
+                      x-init="autosize($el)"
+                      @input="autosize($el)"
+                      class="composer-input"></textarea>
+            <template x-if="!streaming">
+              <button class="btn btn-send" type="submit" :disabled="!input.trim() && !pendingImages.length" title="Send">→</button>
+            </template>
+            <template x-if="streaming">
+              <button class="btn btn-stop" type="button" @click="stop()" title="Stop">■</button>
+            </template>
+          </div>
+          <template x-if="pendingImages.length">
+            <div class="composer-thumbs">
+              <template x-for="(im, ii) in pendingImages" :key="ii">
+                <span class="composer-thumb">
+                  <img :src="im.url" :alt="im.name">
+                  <button type="button" class="composer-thumb-x" @click="pendingImages.splice(ii, 1)" title="Remove">×</button>
+                </span>
+              </template>
+            </div>
+          </template>
+          <template x-if="documents.length">
+            <div class="composer-docs">
+              <template x-for="(doc, di) in documents" :key="di">
+                <span class="composer-doc" :title="doc.name">
+                  📄 <span x-text="doc.name"></span>
+                  <button type="button" class="composer-thumb-x" @click="documents.splice(di, 1)" title="Remove">×</button>
+                </span>
+              </template>
+              <span class="composer-doc-hint">retrieved + cited per question</span>
+            </div>
+          </template>
+          <div class="composer-meta">
+            <label class="composer-attach">
+              <input type="file" @change="attachFile($event)"
+                     accept=".txt,.md,.py,.json,.jsonl,.yaml,.yml,.csv,.html,.css,.js,.ts,.tsx,.jsx,.go,.rs,.toml,.ini,.sh,.pdf,.docx,.png,.jpg,.jpeg,.gif,.webp,.bmp,image/*">
+              <span>📎 attach</span>
+            </label>
+            <button type="button" class="composer-dr" :class="deepResearch ? 'composer-dr-on' : ''"
+                    @click="deepResearch = !deepResearch; localStorage.setItem('optiq.chat.deepResearch', deepResearch ? '1' : '0')"
+                    :title="deepResearch ? 'Deep Research on — plans, searches the web, and writes a cited report' : 'Deep Research off'">
+              🔬 <span x-text="deepResearch ? 'deep research on' : 'deep research'"></span>
+            </button>
+            <span class="composer-status" x-text="streaming ? 'streaming…' : (attachStatus || '')"></span>
+            <div style="flex: 1;"></div>
+            <span class="composer-hint" x-text="deepResearch ? 'researches the web · writes a cited report' : '⏎ send · ⇧⏎ newline'"></span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <aside class="artifact-pane" x-show="artifact" x-cloak>
+      <div class="artifact-head">
+        <span class="artifact-live"></span>
+        <span class="artifact-name" x-text="artifactTitle(artifact)"></span>
+        <span class="artifact-tag" x-text="artifactMd ? 'cited report' : 'sandboxed · runs live'"></span>
+        <span class="artifact-tools">
+          <button class="canvas-btn" type="button" x-show="!artifactMd" @click="restartArtifact()" title="Restart">&#8635; restart</button>
+          <button class="canvas-btn" type="button" @click="artifactSource = !artifactSource"
+                  x-text="artifactSource ? 'preview' : 'source'"></button>
+          <button class="canvas-btn" type="button" @click="downloadArtifact()"
+                  :title="artifactMd ? 'Download the report as Markdown' : 'Download the page as HTML'"
+                  x-text="artifactMd ? '&#8595; .md' : '&#8595; .html'"></button>
+          <button class="canvas-btn" type="button" @click="closeArtifact()" title="Close">&#10005;</button>
+        </span>
+      </div>
+      <!-- Gate on `artifact` as well: without it the iframe is constructed (with a
+           null srcdoc) before anything is ever run, and closing the panel leaves
+           it behind. Nothing should exist until the reader clicks Run. -->
+      <template x-if="artifact && !artifactSource">
+        <iframe class="artifact-frame" sandbox="allow-scripts" :srcdoc="artifact"
+                :key="artifactNonce"></iframe>
+      </template>
+      <template x-if="artifact && artifactSource">
+        <pre class="artifact-source" x-text="artifactMd || artifact"></pre>
+      </template>
+      <div class="artifact-foot">Click the panel, then use the keyboard — the page has focus.</div>
+    </aside>
+
+    <div x-show="!artifact">
+      <div class="side-label" style="margin-bottom: 8px;">Saved</div>
+      <template x-if="chats.length === 0">
+        <div class="empty" style="padding: 16px; font-size: 13px;">No saved chats yet.</div>
+      </template>
+      <template x-for="c in chats" :key="c.id">
+        <div class="card" style="padding: 10px 12px; margin-bottom: 6px;">
+          <div style="display: flex; justify-content: space-between; gap: 6px;">
+            <a href="#" @click.prevent="load(c.id)" style="font-weight: 500;" x-text="c.title"></a>
+            <button class="copy-btn" @click="delChat(c.id)" title="Delete">✕</button>
+          </div>
+          <div style="font-size: 11px; color: var(--mute);" x-text="c.n_messages + ' msgs · ' + (c.model || '').split('/').pop()"></div>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
+
+<style>
+/* ── Settings card ──────────────────────────────────────────────────── */
+.chat-settings { padding: 10px 16px; margin-bottom: 16px; }
+.chat-settings > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--ink-2);
+  list-style: none;
+}
+.chat-settings > summary::-webkit-details-marker { display: none; }
+.chat-settings > summary::before {
+  content: "›";
+  font-family: var(--mono);
+  color: var(--mute);
+  transition: transform 120ms ease;
+}
+.chat-settings[open] > summary::before { transform: rotate(90deg); }
+.chat-settings-summary { display: flex; gap: 6px; flex-wrap: wrap; }
+.chat-settings-grid {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: 1fr 110px 120px 1fr;
+  gap: 12px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--paper-3);
+  color: var(--ink-2);
+}
+.chip-on { background: var(--accent-soft); color: var(--accent); }
+.chip-off { background: var(--paper-3); color: var(--mute); }
+.chip-warn { background: #f8e6c8; color: var(--warn); }
+.chip-btn {
+  display: inline;
+  background: var(--paper-3);
+  color: var(--ink-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  font-family: var(--body);
+  font-size: 13px;
+  padding: 1px 10px;
+  cursor: pointer;
+  margin: 1px 2px;
+}
+.chip-btn:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-soft); }
+
+/* ── Thread ─────────────────────────────────────────────────────────── */
+.thread-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  min-height: 420px;
+}
+.thread {
+  padding: 6px 24px;
+  flex: 1;
+  max-height: 64vh;
+  overflow-y: auto;
+  min-width: 0;
+}
+.thread-empty { text-align: center; padding: 56px 24px; color: var(--mute); }
+.thread-empty h3 { font-family: var(--display); font-weight: 500; color: var(--ink-2); margin: 0 0 12px; }
+.thread-empty-sub { font-size: 14px; line-height: 1.8; }
+.msg {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--rule-soft);
+  min-width: 0;
+}
+.msg:last-child { border-bottom: none; }
+.msg-role {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--mute);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.msg-user .msg-role { color: var(--accent); }
+.msg-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
+}
+/* Background and colour come from lab.css (dark block, light text). Redeclaring
+   the background here at equal specificity flipped it back to light --code-bg
+   while the light colour survived: cream text on cream, contrast 1.0:1. */
+.msg-body pre {
+  overflow-x: auto;
+  max-width: 100%;
+  white-space: pre;
+  min-width: 0;
+}
+.msg-body code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; word-break: break-all; }
+.msg-body p { margin: 0 0 10px; }
+.msg-body p:last-child { margin-bottom: 0; }
+.msg-body h1, .msg-body h2, .msg-body h3 { font-family: var(--display); margin: 14px 0 6px; line-height: 1.3; }
+.msg-body h1 { font-size: 20px; }
+.msg-body h2 { font-size: 17px; }
+.msg-body h3 { font-size: 15px; }
+.msg-body ul, .msg-body ol { margin: 6px 0 10px; padding-left: 22px; }
+.msg-body li { margin: 3px 0; }
+.msg-body blockquote { margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--rule); color: var(--ink-2); }
+.msg-body table { border-collapse: collapse; margin: 8px 0; }
+.msg-body th, .msg-body td { border: 1px solid var(--rule); padding: 4px 8px; }
+.msg-body a { color: var(--accent); }
+.msg-reasoning { margin-top: 8px; font-size: 12px; color: var(--mute); min-width: 0; }
+.msg-reasoning pre { background: var(--paper-2); padding: 8px 10px; border-radius: 4px; overflow-x: auto; max-width: 100%; }
+.thinking-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+/* ── Tool cards ─────────────────────────────────────────────────────── */
+.tool-card {
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  min-width: 0;
+}
+.tool-web_search { border-left-color: #2c6cb9; }
+.tool-python { border-left-color: #03684c; }
+.tool-terminal { border-left-color: #6b3f9c; }
+.tool-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.tool-icon { font-size: 14px; }
+.tool-name { font-weight: 600; color: var(--ink-2); }
+.tool-elapsed { color: var(--mute); margin-left: auto; }
+.tok-rate { margin-left: 8px; font-size: 0.72rem; font-weight: 600; color: var(--accent, #03684c); letter-spacing: 0.02em; }
+.tool-args, .tool-result { margin-top: 4px; }
+.tool-args summary, .tool-result summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  letter-spacing: 0.04em;
+  list-style: none;
+}
+.tool-args summary::-webkit-details-marker, .tool-result summary::-webkit-details-marker { display: none; }
+.tool-args summary::before, .tool-result summary::before { content: "›"; margin-right: 4px; color: var(--mute); }
+.tool-args[open] summary::before, .tool-result[open] summary::before { content: "⌄"; }
+.tool-args pre, .tool-result pre {
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-top: 4px;
+  max-height: 280px;
+  overflow: auto;
+}
+.tool-running {
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.tool-images {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+/* User-attached image thumbnails (inside a message bubble) */
+.msg-images { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.msg-image {
+  max-width: 220px; max-height: 220px; border-radius: 8px;
+  border: 1px solid var(--line); object-fit: cover;
+}
+/* Composer attach previews (pending, before send) */
+.composer-thumbs { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 0 0; }
+.composer-thumb { position: relative; display: inline-block; }
+.composer-thumb img {
+  width: 56px; height: 56px; object-fit: cover;
+  border-radius: 6px; border: 1px solid var(--line);
+}
+.composer-thumb-x {
+  position: absolute; top: -6px; right: -6px;
+  width: 18px; height: 18px; line-height: 16px; padding: 0;
+  border-radius: 50%; border: 1px solid var(--line);
+  background: var(--bg); color: var(--ink); cursor: pointer; font-size: 12px;
+}
+.tool-image {
+  margin: 0;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-sm);
+  padding: 6px;
+  max-width: 100%;
+}
+.tool-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  border-radius: var(--r-sm);
+}
+.tool-image figcaption {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+.chip-err { background: #f5d1d1; color: var(--err); }
+
+/* Adjacent-tool-call group accordion */
+.msg-tool-group { padding: 6px 0 14px; border-bottom: 1px solid var(--rule-soft); }
+.tool-group-wrap > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.tool-group-wrap > summary::-webkit-details-marker { display: none; }
+.tool-group-wrap > summary::before {
+  content: "›";
+  color: var(--mute);
+  transition: transform 120ms ease;
+}
+.tool-group-wrap[open] > summary::before { transform: rotate(90deg); }
+.tool-group-count { font-weight: 600; }
+.tool-group-summary { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; }
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  font-size: 11px;
+}
+.tool-chip.tool-web_search { border-color: #b9d0e8; color: #2c6cb9; }
+.tool-chip.tool-python     { border-color: var(--accent-soft); color: var(--accent); }
+.tool-chip.tool-terminal   { border-color: #d9c5ee; color: #6b3f9c; }
+.tool-group-wrap[open] > summary { margin-bottom: 8px; }
+.tool-group-wrap .tool-card { margin-top: 8px; }
+
+/* ── Composer ───────────────────────────────────────────────────────── */
+.composer {
+  border-top: 1px solid var(--rule-soft);
+  padding: 14px 20px 16px;
+}
+.composer-row { display: flex; gap: 10px; align-items: flex-end; }
+.composer-input {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  border-radius: var(--r-md);
+  padding: 10px 12px;
+  font: inherit;
+  line-height: 1.4;
+  min-height: 38px;
+  max-height: 280px;
+  color: var(--ink);
+}
+.composer-input:focus { outline: none; border-color: var(--accent); }
+.btn-send, .btn-stop {
+  padding: 9px 16px;
+  font-size: 16px;
+  border-radius: var(--r-md);
+}
+.btn-stop {
+  background: var(--err);
+  border-color: var(--err);
+  color: white;
+}
+.btn-stop:hover { background: #921313; border-color: #921313; }
+.composer-meta {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--mute);
+}
+.composer-attach { cursor: pointer; }
+.composer-attach input { display: none; }
+.composer-attach span { padding: 3px 8px; border-radius: var(--r-sm); }
+.composer-attach:hover span { background: var(--paper-3); }
+.composer-status { font-family: var(--mono); font-size: 11px; }
+.composer-hint { font-family: var(--mono); font-size: 11px; }
+
+/* Deep Research toggle in the composer bar */
+.composer-dr {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--mono); font-size: 11px; cursor: pointer;
+  padding: 3px 9px; border-radius: var(--r-sm);
+  border: 1px solid var(--line); background: transparent; color: var(--mute);
+  transition: background .12s, border-color .12s, color .12s;
+}
+.composer-dr:hover { border-color: var(--accent); color: var(--ink, #1a1a17); }
+.composer-dr-on {
+  border-color: var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+/* Deep Research trace card */
+.research-card {
+  border: 1px solid var(--line); border-radius: var(--r-md, 10px);
+  background: var(--paper-2, #f7f5f0); padding: 12px 14px; margin: 4px 0 2px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.research-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; }
+.research-glyph { font-size: 14px; }
+.research-glyph.spin { animation: research-pulse 1.1s ease-in-out infinite; }
+@keyframes research-pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .research-glyph.spin { animation: none; } }
+.research-phase { color: var(--ink, #1a1a17); }
+.research-block { font-size: 12.5px; }
+.research-block > summary { cursor: pointer; color: var(--mute); font-family: var(--mono); font-size: 11px; padding: 2px 0; }
+.research-plan { margin: 4px 0 2px; font-size: 13px; color: #333; }
+.research-src { display: flex; gap: 6px; padding: 2px 0; font-size: 12.5px; line-height: 1.45; }
+.research-src-n { color: var(--accent); font-family: var(--mono); font-size: 11px; flex: none; }
+.research-src a { color: #333; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.research-src a:hover { color: var(--accent); text-decoration: underline; }
+.research-stats { font-family: var(--mono); font-size: 11px; color: var(--mute); }
+.research-stats:empty { display: none; }
+
+#thread { min-width: 0; }
+
+/* Canvas: live render of an HTML artifact in a sandboxed iframe. */
+/* Run card in the transcript */
+.artifact-card {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  margin-top: 12px; padding: 10px 14px; text-align: left; cursor: pointer;
+  background: var(--paper-2); border: 1px solid var(--rule);
+  border-radius: var(--r-md, 10px); font: inherit; color: var(--ink);
+  transition: border-color .15s, box-shadow .15s;
+}
+.artifact-card:hover { border-color: var(--accent); box-shadow: 0 2px 10px rgba(20,19,17,.06); }
+.artifact-card-open { border-color: var(--accent); background: var(--paper); }
+.artifact-glyph {
+  display: grid; place-items: center; width: 30px; height: 30px; flex: none;
+  border-radius: 8px; background: var(--accent); color: #fff; font-size: 11px;
+}
+.artifact-meta { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.artifact-title { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-sub { font-size: 11px; color: var(--mute); }
+.artifact-run {
+  flex: none; font-family: var(--mono); font-size: 11px; letter-spacing: .04em;
+  color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 3px 10px;
+}
+
+/* Right-hand artifact panel */
+.artifact-pane {
+  position: sticky; top: 16px; align-self: start;
+  display: flex; flex-direction: column;
+  height: calc(100vh - 210px); min-height: 420px; max-height: 820px;
+  border: 1px solid var(--rule); border-radius: var(--r-lg, 14px);
+  background: var(--paper); overflow: hidden;
+  box-shadow: 0 1px 2px rgba(20,19,17,.05), 0 12px 34px rgba(20,19,17,.09);
+}
+/* The shell caps content at 1080px; an open artifact needs the room. */
+body.artifact-open .app-main { max-width: 1560px; }
+
+.artifact-head {
+  display: flex; align-items: center; gap: 8px; flex: none; flex-wrap: nowrap;
+  padding: 9px 12px; background: var(--paper-2);
+  border-bottom: 1px solid var(--rule-soft);
+  font-family: var(--mono); font-size: 11px;
+}
+.artifact-live { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.artifact-name {
+  font-weight: 600; font-size: 12px; font-family: var(--sans, inherit);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 0 1 auto; min-width: 0;
+}
+.artifact-tag { color: var(--mute); font-size: 10px; white-space: nowrap; flex: none; }
+.artifact-tools { margin-left: auto; display: flex; gap: 6px; flex: none; }
+.artifact-frame { flex: 1; width: 100%; border: 0; background: #fff; display: block; }
+.artifact-source {
+  flex: 1; margin: 0; overflow: auto; white-space: pre; font-size: 11px;
+  background: var(--ink); color: var(--paper); padding: 14px 16px;
+}
+.artifact-foot {
+  flex: none; padding: 6px 12px; font-size: 10.5px; color: var(--mute);
+  border-top: 1px solid var(--rule-soft); background: var(--paper-2);
+}
+[x-cloak] { display: none !important; }
+
+.canvas-pane { margin-top: 10px; border: 1px solid var(--line, #ddd); border-radius: var(--r-sm, 6px); overflow: hidden; }
+.canvas-head { display: flex; justify-content: space-between; align-items: center; padding: 5px 10px; background: var(--paper-2, #f4f2ee); font-size: 12px; font-weight: 600; }
+.canvas-tag { font-weight: 400; color: var(--mute); font-family: var(--mono); font-size: 10px; }
+.canvas-frame { width: 100%; height: 320px; border: 0; background: #fff; display: block; }
+.canvas-code-wrap { padding: 6px 10px; font-size: 12px; }
+.canvas-code { white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow: auto; font-family: var(--mono); font-size: 11px; }
+
+/* Chat-with-files: attached document chips + citation sources panel. */
+.composer-docs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+.composer-doc { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; background: var(--paper-2, #f4f2ee); border: 1px solid var(--line, #ddd); border-radius: var(--r-sm, 6px); padding: 2px 8px; }
+.composer-doc-hint { font-size: 11px; color: var(--mute); }
+.msg-sources { margin-top: 8px; font-size: 12px; border-top: 1px dashed var(--line, #ddd); padding-top: 6px; }
+.msg-sources summary { cursor: pointer; color: var(--mute); }
+.src-item { display: flex; gap: 6px; padding: 3px 0; align-items: baseline; }
+.src-n { font-weight: 700; color: var(--accent, #03684c); }
+.src-file { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.src-prev { color: var(--mute); overflow: hidden; text-overflow: ellipsis; }
+</style>
+
+<script>
+function chatApp() {
+  return {
+    id: null,
+    model: '',
+    temperature: 0.7,
+    maxTokens: 2048,
+    enableThinking: 'off',
+    toolsEnabled: true,
+    deepResearch: localStorage.getItem('optiq.chat.deepResearch') === '1',
+    jsonMode: 'off',        // off | object | schema
+    jsonSchema: '',
+    // LoRA adapter selection — populated from /api/status.adapters. Empty
+    // string = no adapter active (run base model). Otherwise it's a path
+    // string; the request body sends the basename as the 'adapters' field.
+    mountedAdapters: [],
+    selectedAdapter: localStorage.getItem('optiq.chat.adapter') || '',
+    // Cloud / third-party OpenAI-compatible endpoint (OpenRouter, etc.). When a
+    // base URL is set, the backend proxies chat there with the user's own key,
+    // and the model field holds that provider's model id (e.g. z-ai/glm-5.2).
+    // The key lives only in this browser's localStorage.
+    cloudBaseUrl: localStorage.getItem('optiq.chat.cloudBaseUrl') || '',
+    cloudApiKey: localStorage.getItem('optiq.chat.cloudApiKey') || '',
+    showCloud: !!localStorage.getItem('optiq.chat.cloudBaseUrl'),
+    sandboxKind: '',
+    messages: [],
+    input: '',
+    streaming: false,
+    tokPerSec: null,
+    artifact: null,          // html of the page currently running in the side panel
+    artifactMd: null,        // markdown source when the artifact is a research report (else null → HTML app)
+    artifactSource: false,   // panel shows source instead of the live page
+    artifactNonce: 0,        // bump to remount the iframe (restart the page)
+    _tokStartMs: 0,
+    _tokCount: 0,
+    partial: '',
+    lastEventLabel: '',
+    attachStatus: '',
+    pendingImages: [],   // [{name, url(dataURL)}] attached to the next user turn
+    documents: [],       // [{name, text}] chat-with-files RAG sources
+    lastSources: [],     // citation sources from the most recent retrieval
+    apiUrl: '{{ api_url }}',
+    modelServed: true,      // until the first status poll says otherwise
+    servedModel: null,
+    chats: {{ chats | tojson }},
+    // Per-send cancellation handles
+    sessionId: null,
+    abortCtrl: null,
+
+    async init() {
+      await this.refreshList();
+      try {
+        const r = await fetch('/api/sandbox/info', {credentials: 'same-origin'});
+        if (r.ok) {
+          const d = await r.json();
+          this.sandboxKind = d.kind || 'unknown';
+        }
+      } catch (e) { /* sandbox info endpoint optional */ }
+      this.pollAdapters();
+      // Persist adapter selection across reloads.
+      this.$watch('selectedAdapter', (v) => {
+        if (v) localStorage.setItem('optiq.chat.adapter', v);
+        else localStorage.removeItem('optiq.chat.adapter');
+      });
+      // Persist the cloud endpoint config (base URL + key) across reloads.
+      this.$watch('cloudBaseUrl', (v) => {
+        if (v) localStorage.setItem('optiq.chat.cloudBaseUrl', v);
+        else localStorage.removeItem('optiq.chat.cloudBaseUrl');
+      });
+      this.$watch('cloudApiKey', (v) => {
+        if (v) localStorage.setItem('optiq.chat.cloudApiKey', v);
+        else localStorage.removeItem('optiq.chat.cloudApiKey');
+      });
+    },
+
+    // Reflect what adapters the running server currently has mounted. Poll
+    // every few seconds so a Server-page restart shows up in the dropdown.
+    async pollAdapters() {
+      try {
+        const r = await fetch('/api/status', {credentials: 'same-origin'});
+        if (r.ok) {
+          const d = await r.json();
+          this.modelServed = !!(d.api_reachable && d.model);
+          this.servedModel = d.model || null;
+          this.mountedAdapters = d.adapters || [];
+          // If the previously-selected adapter is no longer mounted, fall
+          // back to base. Don't silently keep stale state.
+          if (this.selectedAdapter
+              && !this.mountedAdapters.includes(this.selectedAdapter)) {
+            this.selectedAdapter = '';
+          }
+        }
+      } catch (e) {}
+      setTimeout(() => this.pollAdapters(), 5000);
+    },
+
+    adapterNameFor(p) {
+      if (!p) return '';
+      const parts = String(p).replace(/\/+$/, '').split('/');
+      return parts[parts.length - 1] || p;
+    },
+
+    toolIcon(name) {
+      if (name === 'web_search') return '🔍';
+      if (name === 'python') return '🐍';
+      if (name === 'terminal') return '$_';
+      return '🛠';
+    },
+
+    // Group consecutive tool messages into a single accordion so the thread
+    // doesn't get visually swamped during multi-step tool runs. Each non-
+    // tool message is its own group. The most-recent (last) tool group is
+    // expanded; older ones are auto-collapsed when an assistant text
+    // message comes in after them.
+    get displayItems() {
+      const out = [];
+      let i = 0;
+      const last = this.messages.length - 1;
+      while (i < this.messages.length) {
+        const m = this.messages[i];
+        if (m.role === 'tool' && m.tool_card) {
+          const cards = [];
+          const startIdx = i;
+          while (i < this.messages.length
+                 && this.messages[i].role === 'tool'
+                 && this.messages[i].tool_card) {
+            cards.push(this.messages[i].tool_card);
+            i++;
+          }
+          // Expanded iff this group is the most recent thing in the thread.
+          // If an assistant text message comes after, auto-collapse.
+          const groupEndIdx = i - 1;
+          const expanded = (groupEndIdx === last);
+          out.push({ type: 'tool-group', cards, expanded, startIdx });
+        } else {
+          out.push({ type: 'message', m, idx: i });
+          i++;
+        }
+      }
+      return out;
+    },
+
+    quick(text) {
+      this.input = text;
+      this.send();
+    },
+
+    autosize(el) {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 280) + 'px';
+    },
+
+    resetThread() {
+      this.id = null;
+      this.messages = [];
+      this.partial = '';
+      this.lastEventLabel = '';
+    },
+
+    async stop() {
+      // Server-side cancel so any running tool subprocess gets SIGKILL'd
+      // through the cancel event. The local fetch is then aborted so we
+      // don't keep reading the SSE stream.
+      if (this.sessionId) {
+        try {
+          await fetch('/api/chat/cancel', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            credentials: 'same-origin',
+            body: JSON.stringify({session_id: this.sessionId}),
+          });
+        } catch (e) {/* best-effort */}
+      }
+      if (this.abortCtrl) {
+        try { this.abortCtrl.abort(); } catch (e) {}
+      }
+    },
+
+    async send() {
+      const text = this.input.trim();
+      if ((!text && !this.pendingImages.length) || this.streaming) return;
+      // With attached images, send a multimodal content array (OpenAI shape):
+      // image parts first, then the text. Otherwise a plain string.
+      let content;
+      if (this.pendingImages.length) {
+        content = this.pendingImages.map(im => ({
+          type: 'image_url', image_url: { url: im.url },
+        }));
+        if (text) content.push({ type: 'text', text });
+        this.pendingImages = [];
+        this.attachStatus = '';
+      } else {
+        content = text;
+      }
+      this.messages.push({ role: 'user', content });
+      this.input = '';
+      this.$nextTick(() => { const el = document.querySelector('.composer-input'); if (el) this.autosize(el); });
+      this.streaming = true;
+      this.partial = '';
+      this.tokPerSec = null;
+      this._tokStartMs = 0;
+      this._tokCount = 0;
+      this.lastEventLabel = '';
+
+      // JSON mode is a single constrained response, so it always takes the
+      // direct path (the tool loop and JSON output are mutually exclusive).
+      // A cloud endpoint must go through the backend proxy (_sendWithTools):
+      // the browser can't call it directly (CORS) and must not hold the key in
+      // a cross-origin request. The backend path also carries tools + JSON mode.
+      if (this.deepResearch) {
+        await this._sendDeepResearch();
+      } else if (this._cloudActive() || (this.toolsEnabled && this.jsonMode === 'off')) {
+        await this._sendWithTools();
+      } else {
+        await this._sendDirect();
+      }
+
+      this.partial = '';
+      this.streaming = false;
+      this.lastEventLabel = '';
+      this.scrollBottom();
+    },
+
+    // Live decode-speed readout. Start the clock on the first token so the
+    // figure reflects steady-state generation, not the prompt-processing wait.
+    _tickTok() {
+      const now = performance.now();
+      if (!this._tokStartMs) { this._tokStartMs = now; this._tokCount = 0; return; }
+      this._tokCount += 1;
+      const secs = (now - this._tokStartMs) / 1000;
+      if (secs > 0.2) this.tokPerSec = Math.round(this._tokCount / secs);
+    },
+
+    // Tools path: SSE from /api/chat/stream
+    async _sendWithTools() {
+      const apiMessages = this.messages
+        .filter(m => m.role !== 'tool' || !m.tool_card)  // strip UI-only tool cards
+        .map(({role, content, tool_calls, tool_call_id, name}) => {
+          const m = { role, content };
+          if (tool_calls) m.tool_calls = tool_calls;
+          if (tool_call_id) m.tool_call_id = tool_call_id;
+          if (name) m.name = name;
+          return m;
+        });
+
+      let pendingByCall = {};
+      this.abortCtrl = new AbortController();
+
+      try {
+        const resp = await fetch('/api/chat/stream', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          credentials: 'same-origin',
+          signal: this.abortCtrl.signal,
+          body: JSON.stringify({
+            model: this.model || undefined,
+            messages: apiMessages,
+            temperature: this.temperature,
+            max_tokens: this.maxTokens,
+            enable_thinking: this.enableThinking === 'auto' ? null : (this.enableThinking === 'on'),
+            tools_enabled: this.toolsEnabled,
+            documents: this.documents.length ? this.documents : undefined,
+            response_format: this._responseFormat() || undefined,
+            adapter: this.selectedAdapter
+                     ? this.adapterNameFor(this.selectedAdapter)
+                     : null,
+            // Cloud endpoint (OpenRouter, any OpenAI-compatible): the backend
+            // proxies here with the user's own key. Empty -> local server.
+            base_url: this._cloudActive() ? this.cloudBaseUrl : undefined,
+            api_key: this._cloudActive() ? (this.cloudApiKey || undefined) : undefined,
+          }),
+        });
+        if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+            const ev = this._parseSSE(frame);
+            if (!ev) continue;
+            this._handleEvent(ev, pendingByCall);
+          }
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          // User clicked Stop. Don't surface as error.
+        } else {
+          this.messages.push({ role: 'assistant', content: '(error: ' + e.message + ')' });
+        }
+      } finally {
+        this.abortCtrl = null;
+        this.sessionId = null;
+      }
+    },
+
+    // Deep Research path: SSE from /api/research/stream. Renders a single
+    // research-trace card that updates as the workflow runs, then drops the
+    // Markdown report into the artifact pane and a short answer into the chat.
+    async _sendDeepResearch() {
+      const apiMessages = this.messages
+        .filter(m => (m.role !== 'tool' || !m.tool_card) && !m.research)
+        .map(({ role, content }) => ({ role, content }));
+
+      this.messages.push({ role: 'assistant', research: {
+        phase: 'starting', phaseLabel: 'Starting…', round: 0,
+        plan: '', searches: [], sources: [], repaired: 0,
+        report_md: '', report_html: '', summary: '', error: '', done: false,
+      } });
+      // Mutate the REACTIVE copy Alpine tracks (the one now inside `messages`),
+      // not the pre-push literal — otherwise the card never re-renders as it fills.
+      const card = this.messages[this.messages.length - 1].research;
+      this.scrollBottom();
+      this.abortCtrl = new AbortController();
+
+      try {
+        const resp = await fetch('/api/research/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          signal: this.abortCtrl.signal,
+          body: JSON.stringify({
+            model: this.model || undefined,
+            messages: apiMessages,
+            temperature: this.temperature,
+            base_url: this._cloudActive() ? this.cloudBaseUrl : undefined,
+            api_key: this._cloudActive() ? (this.cloudApiKey || undefined) : undefined,
+          }),
+        });
+        if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+            const ev = this._parseSSE(frame);
+            if (ev) this._handleResearchEvent(ev, card);
+          }
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') { card.error = e.message; card.done = true; }
+      } finally {
+        this.abortCtrl = null;
+        this.sessionId = null;
+      }
+    },
+
+    _handleResearchEvent(ev, card) {
+      const d = ev.data || {};
+      switch (ev.event) {
+        case 'session': this.sessionId = d.session_id; break;
+        case 'phase':
+          card.phase = d.phase;
+          if (d.round) card.round = d.round;
+          card.phaseLabel = this._researchPhaseLabel(d.phase, card.round);
+          this.lastEventLabel = '🔬 ' + card.phaseLabel;
+          break;
+        case 'plan': card.plan = d.outline || ''; break;
+        case 'search': card.searches.push({ query: d.query, n: (d.results || []).length }); break;
+        case 'source': card.sources.push({ url: d.url, title: d.title || d.url }); break;
+        case 'verified': card.repaired = d.repaired || d.dropped || 0; break;
+        case 'report': {
+          card.report_md = d.report || '';
+          card.report_html = this._reportHtml(d.report || '');
+          card.summary = d.summary || '';
+          card.done = true;
+          card.phaseLabel = 'Report ready';
+          this.lastEventLabel = '';
+          const sources = (d.sources || []).map((s, i) => ({ n: i + 1, url: s.url, title: s.title }));
+          if (d.summary) {
+            this.messages.push({
+              role: 'assistant', content: d.summary,
+              sources: sources.length ? sources : undefined,
+            });
+          }
+          this.openArtifact(card.report_html, card.report_md);
+          break;
+        }
+        case 'cancelled': card.error = 'stopped'; card.done = true; this.lastEventLabel = ''; break;
+        case 'error': card.error = d.message || 'error'; card.done = true; this.lastEventLabel = ''; break;
+      }
+      this.scrollBottom();
+    },
+
+    _researchPhaseLabel(phase, round) {
+      const r = round ? ' · round ' + round : '';
+      return ({
+        starting: 'Starting…',
+        planning: 'Planning the report',
+        drafting: 'Writing a first draft',
+        searching: 'Searching the web' + r,
+        refining: 'Folding in findings' + r,
+        auditing: 'Auditing claims',
+        writing: 'Writing the report',
+        verifying: 'Checking citations',
+      })[phase] || phase;
+    },
+
+    // Wrap the Markdown report as a self-contained styled HTML page for the
+    // sandboxed artifact iframe (same pane the model's HTML artifacts use).
+    _reportHtml(md) {
+      const body = (typeof marked !== 'undefined')
+        ? marked.parse(md, { gfm: true, breaks: true })
+        : md.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      return '<!doctype html><html><head><meta charset="utf-8">'
+        + '<style>'
+        + ':root{color-scheme:light}'
+        + '*{box-sizing:border-box}'
+        + 'body{margin:0;background:#fbfaf7;color:#1a1a17;'
+        + 'font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;'
+        + '-webkit-font-smoothing:antialiased}'
+        + '.report{max-width:760px;margin:0 auto;padding:40px 44px 72px}'
+        + '.report h1{font-size:26px;line-height:1.25;margin:0 0 18px;letter-spacing:-.01em}'
+        + '.report h2{font-size:19px;margin:34px 0 10px;padding-bottom:5px;border-bottom:1px solid #ece8df;letter-spacing:-.01em}'
+        + '.report h3{font-size:15.5px;margin:22px 0 8px}'
+        + '.report p{margin:0 0 14px}'
+        + '.report a{color:#03684c;text-decoration:none;border-bottom:1px solid rgba(3,104,76,.3)}'
+        + '.report a:hover{border-bottom-color:#03684c}'
+        + '.report sup,.report a[href^="#"]{color:#03684c}'
+        + '.report ul,.report ol{margin:0 0 14px;padding-left:22px}'
+        + '.report li{margin:4px 0}'
+        + '.report table{border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;display:block;overflow-x:auto}'
+        + '.report th,.report td{border:1px solid #e6e1d6;padding:7px 10px;text-align:left;vertical-align:top}'
+        + '.report th{background:#f4f1ea;font-weight:600}'
+        + '.report code{background:#f1efe8;padding:1px 5px;border-radius:4px;font-size:.9em;'
+        + 'font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace}'
+        + '.report pre{background:#f4f1ea;padding:14px;border-radius:8px;overflow-x:auto}'
+        + '.report pre code{background:none;padding:0}'
+        + '.report blockquote{margin:14px 0;padding:2px 16px;border-left:3px solid #d8d2c4;color:#555}'
+        + '.report hr{border:0;border-top:1px solid #ece8df;margin:26px 0}'
+        + '</style></head><body><article class="report">' + body + '</article></body></html>';
+    },
+
+    _parseSSE(frame) {
+      let event = 'message', data = '';
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
+      }
+      if (!data) return null;
+      try { return { event, data: JSON.parse(data) }; } catch (e) { return null; }
+    },
+
+    _handleEvent(ev, pending) {
+      if (ev.event === 'session') {
+        this.sessionId = ev.data.session_id;
+        return;
+      }
+      if (ev.event === 'sources') {
+        // Chat-with-files retrieval: stash the citation sources; they get
+        // attached to the assistant answer when it finalizes.
+        this.lastSources = ev.data.sources || [];
+        return;
+      }
+      if (ev.event === 'cancelled') {
+        this.messages.push({ role: 'assistant', content: '(stopped)' });
+        return;
+      }
+      if (ev.event === 'tool_call') {
+        this.lastEventLabel = '🛠 calling ' + ev.data.name + '…';
+        const card = {
+          id: ev.data.id,
+          name: ev.data.name,
+          arguments: ev.data.arguments,
+          healed: ev.data.healed,
+          duplicate: ev.data.duplicate || false,
+          retry_exhausted: ev.data.retry_exhausted || false,
+          errored: false,
+          result: null,
+          elapsed_sec: null,
+        };
+        pending[ev.data.id] = card;
+        this.messages.push({ role: 'tool', tool_card: card });
+        this.scrollBottom();
+      } else if (ev.event === 'tool_result') {
+        const card = pending[ev.data.id];
+        if (card) {
+          card.result = ev.data.result;
+          card.elapsed_sec = ev.data.elapsed_sec;
+          card.errored = ev.data.errored || false;
+          card.images = ev.data.images || [];
+        }
+        this.lastEventLabel = '';
+        this.scrollBottom();
+      } else if (ev.event === 'token') {
+        this.partial += ev.data.text || '';
+        this._tickTok();
+        this.scrollBottom();
+      } else if (ev.event === 'replace') {
+        // Server rewrote what it streamed (e.g. healing pulled a tool call out
+        // of the prose). Swap in the corrected transcript for this turn.
+        this.partial = ev.data.text || '';
+        this.scrollBottom();
+      } else if (ev.event === 'assistant') {
+        this.messages.push({
+          role: 'assistant',
+          content: ev.data.content || '',
+          reasoning: ev.data.reasoning || undefined,
+          sources: this.lastSources.length ? this.lastSources : undefined,
+          tok_per_sec: this.tokPerSec,
+        });
+        this.partial = '';
+        this.lastSources = [];
+      } else if (ev.event === 'error') {
+        this.messages.push({ role: 'assistant', content: '(error: ' + (ev.data.message || 'unknown') + ')' });
+      }
+    },
+
+    // No-tools path: direct stream from mlx-lm
+    // Build the OpenAI response_format object from the JSON-mode controls.
+    // 'object' = any valid JSON; 'schema' = constrain to the supplied schema.
+    // A malformed schema falls back to json_object so output is still valid JSON.
+    // Cloud endpoint is in effect only when the source toggle is on AND a base
+    // URL is set. A saved URL with the toggle off stays inert.
+    _cloudActive() {
+      return this.showCloud && !!(this.cloudBaseUrl || '').trim();
+    },
+
+    _responseFormat() {
+      if (this.jsonMode === 'object') return { type: 'json_object' };
+      if (this.jsonMode === 'schema') {
+        try {
+          const schema = JSON.parse(this.jsonSchema || '{}');
+          return { type: 'json_schema', json_schema: { name: 'response', schema } };
+        } catch (e) {
+          console.warn('JSON schema is not valid JSON, falling back to json_object:', e.message);
+          return { type: 'json_object' };
+        }
+      }
+      return null;
+    },
+
+    async _sendDirect() {
+      const body = {
+        model: this.model || undefined,
+        messages: this.messages
+          .filter(m => m.role !== 'tool')
+          .map(({role, content}) => ({role, content})),
+        stream: true,
+        max_tokens: this.maxTokens,
+        temperature: this.temperature,
+      };
+      if (this.enableThinking !== 'auto') {
+        body.chat_template_kwargs = { enable_thinking: this.enableThinking === 'on' };
+      }
+      if (this.selectedAdapter) {
+        // optiq serve patches mlx_lm.server to read this field and flip
+        // the active-adapter ContextVar for the duration of the request.
+        body.adapters = this.adapterNameFor(this.selectedAdapter);
+      }
+      const rf = this._responseFormat();
+      if (rf) { body.response_format = rf; }
+
+      let assembled = '';
+      let reasoning = '';
+      try {
+        const resp = await fetch(this.apiUrl + '/v1/chat/completions', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer sk-optiq-local'},
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+            for (const line of frame.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              const payload = line.slice(5).trim();
+              if (payload === '[DONE]') continue;
+              try {
+                const chunk = JSON.parse(payload);
+                const delta = chunk.choices?.[0]?.delta || {};
+                if (delta.content) { assembled += delta.content; this.partial = assembled; this._tickTok(); this.scrollBottom(); }
+                // Reasoning tokens are tokens: count them too, or a model
+                // that thinks before it answers shows no rate at all.
+                if (delta.reasoning) { reasoning += delta.reasoning; this._tickTok(); }
+              } catch (e) {}
+            }
+          }
+        }
+      } catch (e) {
+        assembled = '(error: ' + e.message + ')';
+      }
+
+      this.messages.push({ role: 'assistant', content: assembled, reasoning: reasoning || undefined, tok_per_sec: this.tokPerSec });
+    },
+
+    async save() {
+      const firstUser = this.messages.find(m => m.role === 'user')?.content;
+      const titleText = Array.isArray(firstUser)
+        ? (firstUser.find(p => p && p.type === 'text')?.text || '🖼 image')
+        : firstUser;
+      const title = (titleText || '').slice(0, 60) || 'Untitled chat';
+      const cleaned = this.messages.map(m => {
+        if (m.role === 'tool' && m.tool_card) {
+          return { role: 'tool', tool_card: m.tool_card };
+        }
+        const out = { role: m.role, content: m.content };
+        if (m.reasoning) out.reasoning = m.reasoning;
+        if (m.tool_calls) out.tool_calls = m.tool_calls;
+        return out;
+      });
+      const resp = await fetch('/api/chats', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ id: this.id, title, model: this.model, messages: cleaned }),
+        credentials: 'same-origin',
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        this.id = data.id;
+        await this.refreshList();
+      }
+    },
+
+    async load(id) {
+      const resp = await fetch('/api/chats/' + id, {credentials: 'same-origin'});
+      if (!resp.ok) return;
+      const data = await resp.json();
+      this.id = data.id;
+      this.model = data.model || '';
+      this.messages = data.messages || [];
+      this.partial = '';
+      this.scrollBottom();
+    },
+
+    async delChat(id) {
+      if (!confirm('Delete this chat?')) return;
+      await fetch('/api/chats/' + id, {method: 'DELETE', credentials: 'same-origin'});
+      if (this.id === id) this.resetThread();
+      await this.refreshList();
+    },
+
+    async refreshList() {
+      const resp = await fetch('/api/chats', {credentials: 'same-origin'});
+      if (resp.ok) {
+        const data = await resp.json();
+        this.chats = data.chats || [];
+      }
+    },
+
+    async attachFile(ev) {
+      const f = ev.target.files[0];
+      if (!f) return;
+
+      // Images ride along as image_url parts for the vision model (no text
+      // extraction). Everything else is extracted to text as before.
+      const isImage = /\.(png|jpe?g|gif|webp|bmp)$/i.test(f.name)
+                      || (f.type || '').startsWith('image/');
+      if (isImage) {
+        try {
+          const url = await new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(r.result);
+            r.onerror = reject;
+            r.readAsDataURL(f);
+          });
+          this.pendingImages.push({ name: f.name, url });
+          this.attachStatus = '🖼 ' + f.name;
+        } catch (e) {
+          this.attachStatus = 'failed: ' + e.message;
+        }
+        ev.target.value = '';
+        return;
+      }
+
+      // Non-image files become retrieval documents (chat-with-files RAG): we
+      // index + cite the relevant chunks instead of dumping the whole file
+      // into the prompt. Stored in this.documents and sent as `documents`.
+      this.attachStatus = 'indexing ' + f.name + '…';
+      const isBinary = /\.(pdf|docx)$/i.test(f.name);
+      try {
+        let text;
+        if (isBinary) {
+          const form = new FormData();
+          form.append('file', f);
+          const r = await fetch('/api/files/extract', {method: 'POST', body: form, credentials: 'same-origin'});
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          text = (await r.json()).text || '';
+        } else {
+          text = await f.text();
+        }
+        this.documents.push({ name: f.name, text });
+        this.attachStatus = '📄 indexed ' + f.name;
+      } catch (e) {
+        this.attachStatus = 'failed: ' + e.message;
+      }
+      ev.target.value = '';
+      this.$nextTick(() => { const el = document.querySelector('.composer-input'); if (el) this.autosize(el); });
+    },
+
+    renderBody(text) {
+      // Multimodal user turns carry an array of {type:text|image_url,...} parts.
+      if (Array.isArray(text)) {
+        text = text.filter(p => p && p.type === 'text').map(p => p.text).join('\n');
+      }
+      if (!text) return '';
+      if (typeof marked !== 'undefined') {
+        try { return marked.parse(text, { gfm: true, breaks: true }); } catch (e) {}
+      }
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    },
+
+    // Artifacts: an HTML page the model wrote runs on demand, in the side panel,
+    // never inline and never on arrival — the reader decides when to execute it.
+    openArtifact(html, md = null) {
+      this.artifact = html;
+      this.artifactMd = md;   // non-null => a research report; download saves the .md
+      this.artifactSource = false;
+      this.artifactNonce++;
+    },
+    closeArtifact() { this.artifact = null; this.artifactMd = null; },
+    // Download the artifact: a research report as its original Markdown, a
+    // model-authored HTML app as its HTML source.
+    downloadArtifact() {
+      const isMd = !!this.artifactMd;
+      const text = isMd ? this.artifactMd : (this.artifact || '');
+      const blob = new Blob([text], { type: isMd ? 'text/markdown' : 'text/html' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = isMd ? 'research-report.md' : 'artifact.html';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    restartArtifact() {
+      const html = this.artifact;
+      this.artifact = null;
+      this.$nextTick(() => { this.artifact = html; this.artifactNonce++; });
+    },
+    artifactTitle(html) {
+      if (!html) return 'Untitled page';
+      const t = html.match(/<title>([^<]*)<\/title>/i);
+      if (t && t[1].trim()) return t[1].trim();
+      const h = html.match(/<h1[^>]*>([^<]*)<\/h1>/i);
+      return (h && h[1].trim()) || 'Untitled page';
+    },
+
+    // Canvas: pull standalone HTML blocks out of an assistant message so they
+    // can render live in a sandboxed iframe. Only fenced ```html blocks that
+    // actually contain markup are treated as renderable artifacts.
+    htmlArtifacts(content) {
+      if (typeof content !== 'string') return [];
+      const out = [];
+      // Any fenced block tagged html / svg / xml (or untagged) that actually
+      // contains renderable markup becomes a live Canvas. SVG / component
+      // fragments are wrapped in a minimal HTML shell so they render centered.
+      const re = /```(html|svg|xml)?\s*\n([\s\S]*?)```/gi;
+      let m;
+      while ((m = re.exec(content)) !== null) {
+        const lang = (m[1] || '').toLowerCase();
+        let code = (m[2] || '').trim();
+        const looksMarkup = /<\s*(html|body|svg|canvas|div|h[1-6]|table|ul|ol|p|script|style|button|form|section|main|header)\b/i.test(code);
+        if (!looksMarkup && lang !== 'html' && lang !== 'svg') continue;
+        const isFullDoc = /<!doctype html|<html[\s>]/i.test(code);
+        if (!isFullDoc) {
+          // Wrap bare SVG / components so they render nicely.
+          code = `<!doctype html><html><head><meta charset="utf-8">` +
+                 `<style>html,body{margin:0;height:100%}body{display:grid;place-items:center;` +
+                 `font-family:system-ui,-apple-system,sans-serif;background:#fff}</style></head>` +
+                 `<body>${code}</body></html>`;
+        }
+        out.push(code);
+      }
+      return out;
+    },
+
+    // The image data-URLs in a multimodal user turn, for inline thumbnails.
+    messageImages(content) {
+      if (!Array.isArray(content)) return [];
+      return content
+        .filter(p => p && p.type === 'image_url')
+        .map(p => (p.image_url && p.image_url.url) || '')
+        .filter(Boolean);
+    },
+
+    scrollBottom() {
+      this.$nextTick(() => {
+        const el = document.getElementById('thread');
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    },
+  };
+}
+</script>
+{% endblock %}

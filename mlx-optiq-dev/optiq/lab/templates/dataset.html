@@ -1,0 +1,204 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="datasetWizard()" x-init="init()">
+  <span class="page-eyebrow">Workflow · dataset</span>
+  <h1 class="page-title">Build a dataset</h1>
+  <p class="page-lead">
+    Fourteen templates to turn pairs, docs, code, seeds, images, and HF datasets
+    into JSONL the fine-tune workflow can consume (text, DPO preference pairs, or
+    image+text for vision LoRA). The LLM-driven templates call this Lab's API.
+  </p>
+
+  {# Step 1: pick template #}
+  <div x-show="step === 0">
+    <h2>Pick a template</h2>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;">
+      <template x-for="t in templates" :key="t.id">
+        <div class="card" style="margin: 0; cursor: pointer;"
+             @click="selectTemplate(t)">
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <h3 style="margin: 0;" x-text="t.label"></h3>
+            <template x-if="t.needs_llm"><span class="pill pill-warn">uses LLM</span></template>
+            <span class="pill pill-idle" x-text="t.output_format"></span>
+          </div>
+          <p style="color: var(--mute); font-size: 13px; margin: 6px 0 0;" x-text="t.description"></p>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  {# Step 2: fill inputs #}
+  <div class="card" x-show="step === 1">
+    <h2 x-text="selected?.label"></h2>
+    <p style="color: var(--mute); font-size: 13px;" x-text="selected?.description"></p>
+    <template x-for="f in (selected?.fields || [])" :key="f.name">
+      <div class="form-row">
+        <label x-text="f.label + (f.required ? ' *' : '')"></label>
+        <template x-if="f.type === 'textarea'">
+          <textarea x-model="inputs[f.name]" rows="6" :placeholder="f.hint || ''"></textarea>
+        </template>
+        <template x-if="f.type === 'text'">
+          <input type="text" x-model="inputs[f.name]" :placeholder="f.hint || ''">
+        </template>
+        <template x-if="f.type === 'number'">
+          <input type="number" x-model.number="inputs[f.name]" :value="f.default">
+        </template>
+      </div>
+    </template>
+    <div style="display: flex; gap: 8px;">
+      <button class="btn btn-ghost" @click="step = 0; selected = null;">Back</button>
+      <button class="btn" @click="submit()">Generate</button>
+    </div>
+  </div>
+
+  {# Step 3: run #}
+  <div class="card" x-show="step === 2">
+    <h2>Generating</h2>
+    <div style="margin-bottom: 12px;">
+      <div style="height: 8px; background: var(--paper-3); border-radius: 4px; overflow: hidden;">
+        <div style="height: 100%; background: var(--accent); transition: width 0.4s;"
+             :style="'width: ' + Math.round((progress || 0) * 100) + '%;'"></div>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--mute); margin-top: 6px;">
+        <span x-text="message || 'Starting…'"></span>
+        <span x-text="Math.round((progress || 0) * 100) + '%'"></span>
+      </div>
+    </div>
+    <pre x-ref="logEl" style="max-height: 280px; overflow-y: auto; font-size: 11.5px;"
+         x-text="logLines.slice(-200).join('\n')"></pre>
+  </div>
+
+  {# Step 4: save / push #}
+  <div class="card" x-show="step === 3">
+    <h2 style="margin-top: 0;">Done</h2>
+    <p>Dataset written to:</p>
+    <pre x-text="outputDir"></pre>
+    <p style="color: var(--mute); font-size: 13px;">
+      Point Fine-tune → Dataset at <code x-text="outputDir"></code> to use it.
+    </p>
+
+    <h3>Push to Hugging Face as a dataset</h3>
+    <div class="form-row"><label>Repository (e.g. username/my-dataset)</label>
+      <input type="text" x-model="repoId" placeholder="your-username/my-dataset"></div>
+    <div class="form-row">
+      <label style="display: inline-flex; gap: 6px;">
+        <input type="checkbox" x-model="repoPrivate"> Private
+      </label>
+    </div>
+    <div class="form-row"><label>Lab password</label>
+      <input type="password" x-model="pushPassword"></div>
+
+    <template x-if="pushResult && pushResult.ok">
+      <div class="flash flash-ok">Pushed: <a :href="pushResult.url" target="_blank" x-text="pushResult.url"></a></div>
+    </template>
+    <template x-if="pushResult && !pushResult.ok">
+      <div class="flash flash-err" x-text="pushResult.error"></div>
+    </template>
+
+    <div style="display: flex; gap: 8px;">
+      <button class="btn" :disabled="pushing || !repoId.trim() || !pushPassword" @click="push()">
+        <span x-text="pushing ? 'Pushing…' : 'Push to HF'"></span>
+      </button>
+      <a class="btn btn-ghost" href="{{ url_for('dataset.dataset_page') }}">Build another</a>
+    </div>
+  </div>
+</div>
+
+<script>
+function datasetWizard() {
+  return {
+    step: 0,
+    templates: {{ templates | tojson }},
+    selected: null,
+    inputs: {},
+
+    jobId: null,
+    progress: 0, message: '',
+    logLines: [],
+    outputDir: '',
+
+    repoId: '', repoPrivate: true, pushPassword: '',
+    pushing: false, pushResult: null,
+
+    init() {
+      const params = new URLSearchParams(window.location.search);
+      const jid = params.get('job_id');
+      if (jid) {
+        this.jobId = jid;
+        this.step = 2;
+        this.attachStream();
+      }
+    },
+
+    selectTemplate(t) {
+      this.selected = t;
+      this.inputs = {};
+      for (const f of (t.fields || [])) {
+        if (f.default !== undefined) this.inputs[f.name] = f.default;
+      }
+      this.step = 1;
+    },
+
+    async submit() {
+      const r = await fetch('/api/dataset/submit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          template_id: this.selected.id,
+          inputs: this.inputs,
+        }),
+        credentials: 'same-origin',
+      });
+      const data = await r.json();
+      if (!data.ok) { alert(data.error); return; }
+      this.jobId = data.job_id;
+      this.outputDir = data.output_dir;
+      this.step = 2;
+      history.replaceState({}, '', '?job_id=' + this.jobId);
+      this.attachStream();
+    },
+
+    attachStream() {
+      if (!this.jobId) return;
+      const es = new EventSource('/api/jobs/' + this.jobId + '/stream');
+      es.onmessage = (ev) => {
+        try {
+          const e = JSON.parse(ev.data);
+          if (e.type === 'log') {
+            this.logLines.push(e.line);
+          } else if (e.type === 'stage') {
+            this.progress = e.progress || this.progress;
+            this.message = e.message || this.message;
+            if (e.stage === 'done') {
+              this.outputDir = e.output_dir || this.outputDir;
+              this.progress = 1;
+              this.step = 3;
+              es.close();
+            }
+          } else if (e.type === 'failed') {
+            this.message = 'Failed: ' + (e.error || 'unknown');
+            es.close();
+          }
+        } catch (err) {}
+      };
+      es.addEventListener('end', () => es.close());
+    },
+
+    async push() {
+      this.pushing = true; this.pushResult = null;
+      const r = await fetch('/api/dataset/push', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          job_id: this.jobId, repo_id: this.repoId.trim(),
+          private: this.repoPrivate, password: this.pushPassword,
+        }),
+        credentials: 'same-origin',
+      });
+      this.pushResult = await r.json();
+      this.pushing = false;
+    },
+  };
+}
+</script>
+{% endblock %}

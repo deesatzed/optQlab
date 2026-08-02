@@ -1,0 +1,107 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="arenaApp()" x-init="init()">
+  <h1 style="margin-top: 0;">Model Arena</h1>
+  <p class="hint">Compare two models on the same prompt, side by side, with tokens/sec. Model A runs on the main server; model B runs on a second server (port + 1). Both are resident at once, so prefer small/fast models.</p>
+
+  <div class="arena-pickers">
+    <div class="card">
+      <label>Model A <span style="color:var(--mute)">(main server)</span></label>
+      <select x-model="modelA"><template x-for="m in choices" :key="'a'+m.value"><option :value="m.value" x-text="m.label"></option></template></select>
+      <button class="btn" style="margin-top:8px;" @click="loadA($event)">Load A</button>
+      <div class="hint" x-text="statusA"></div>
+    </div>
+    <div class="card">
+      <label>Model B <span style="color:var(--mute)">(second server)</span></label>
+      <select x-model="modelB"><template x-for="m in choices" :key="'b'+m.value"><option :value="m.value" x-text="m.label"></option></template></select>
+      <button class="btn" style="margin-top:8px;" @click="loadB($event)">Load B</button>
+      <div class="hint" x-text="statusB"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Prompt</label>
+    <textarea x-model="prompt" rows="3" placeholder="Ask both models the same thing…" style="width:100%;"></textarea>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:8px;">
+      <label style="display:flex; gap:6px; align-items:center;">Max tokens <input type="number" min="16" max="2048" x-model.number="maxTokens" style="width:90px;"></label>
+      <button class="btn" @click="run()" :disabled="running" x-text="running ? 'Running…' : 'Compare'"></button>
+    </div>
+  </div>
+
+  <div class="arena-results">
+    <div class="card arena-pane">
+      <div class="arena-head">
+        <span x-text="shortName(modelA) || 'Model A'"></span>
+        <span class="pill pill-ok" x-show="a.tok_per_sec" x-text="a.tok_per_sec + ' tok/s'"></span>
+      </div>
+      <div class="arena-body" x-html="renderMd(a.content || a.reasoning)"></div>
+      <div class="hint" x-show="a.elapsed_sec" x-text="a.tokens + ' tok in ' + a.elapsed_sec + 's'"></div>
+      <div class="flash flash-error" x-show="a.error" x-text="a.error"></div>
+    </div>
+    <div class="card arena-pane">
+      <div class="arena-head">
+        <span x-text="shortName(modelB) || 'Model B'"></span>
+        <span class="pill pill-ok" x-show="b.tok_per_sec" x-text="b.tok_per_sec + ' tok/s'"></span>
+      </div>
+      <div class="arena-body" x-html="renderMd(b.content || b.reasoning)"></div>
+      <div class="hint" x-show="b.elapsed_sec" x-text="b.tokens + ' tok in ' + b.elapsed_sec + 's'"></div>
+      <div class="flash flash-error" x-show="b.error" x-text="b.error"></div>
+    </div>
+  </div>
+</div>
+
+<style>
+.arena-pickers, .arena-results { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.arena-pane { min-height:160px; display:flex; flex-direction:column; gap:6px; }
+.arena-head { display:flex; justify-content:space-between; align-items:center; font-weight:600; font-size:14px; }
+.arena-body { font-size:14px; line-height:1.5; }
+</style>
+
+<script>
+function arenaApp() {
+  return {
+    choices: [], modelA: '', modelB: '', prompt: '', maxTokens: 256,
+    running: false, statusA: '', statusB: '', a: {}, b: {},
+    async init() {
+      const ch = [];
+      try {
+        const r = await fetch('/api/server/published', {credentials:'same-origin'});
+        const d = await r.json();
+        (d.quants || []).forEach(q => ch.push({value:q.repo_id, label:q.repo_id}));
+      } catch(e) {}
+      try {
+        const r = await fetch('/api/hub/local', {credentials:'same-origin'});
+        const d = await r.json();
+        (d.models || []).forEach(m => ch.push({value:m.path, label:m.name + ' (local)'}));
+      } catch(e) {}
+      this.choices = ch;
+      if (ch.length) { this.modelA = ch[0].value; this.modelB = ch[Math.min(1,ch.length-1)].value; }
+    },
+    shortName(m){ if(!m) return ''; const p=m.split('/').filter(Boolean); let c=p[p.length-1]; if(c==='optiq_mixed'&&p.length>1)c=p[p.length-2]; return c; },
+    renderMd(t){ try { return window.marked ? marked.parse(t||'') : (t||''); } catch(e){ return t||''; } },
+    async loadA(ev){ await this._load('/api/server/apply', {model:this.modelA}, ev, s=>this.statusA=s); },
+    async loadB(ev){ await this._load('/api/arena/load_b', {model:this.modelB}, ev, s=>this.statusB=s); },
+    async _load(url, body, ev, setStatus){
+      const btn=ev.target, orig=btn.textContent; btn.textContent='Loading…'; btn.disabled=true; setStatus('loading…');
+      try { const r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        const d=await r.json(); setStatus(d.ok ? 'ready' : ('error: '+(d.error||'failed'))); }
+      catch(e){ setStatus('error: '+e); }
+      btn.textContent=orig; btn.disabled=false;
+    },
+    async run(){
+      if(!this.prompt.trim()) return;
+      this.running=true; this.a={}; this.b={};
+      try {
+        const r=await fetch('/api/arena/run',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({model_a:this.modelA, model_b:this.modelB, max_tokens:this.maxTokens,
+            messages:[{role:'user',content:this.prompt}]})});
+        const d=await r.json();
+        if(d.ok){ this.a=d.a||{}; this.b=d.b||{}; }
+        else { this.a={error:d.error||'failed'}; }
+      } catch(e){ this.a={error:String(e)}; }
+      this.running=false;
+    }
+  };
+}
+</script>
+{% endblock %}

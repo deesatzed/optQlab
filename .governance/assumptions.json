@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "project": "optiqlab-interactive-prototype",
+  "updated_at": "2026-08-02T00:00:00Z",
+  "assumptions": [
+    {
+      "id": "A-0001",
+      "text": "This workspace is a UI/UX prototype only and is not the production mlx-optiq Lab codebase.",
+      "source": "file inventory; no Flask/Python Lab; docs/build/02-discovery-deepdive.md",
+      "risk": "HIGH",
+      "status": "validated",
+      "verification_method": "Confirm absence of create_app / optiq.lab and presence of seed BUILDS in OptiQ Lab.dc.html",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "discovery-deepdive+forensics",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0002",
+      "text": "All Capability Scores, metric bars, tok/s, and run progress values are fictional seed data for design, not measured results.",
+      "source": "const BUILDS / RUNS in OptiQ Lab.dc.html:L538+",
+      "risk": "HIGH",
+      "status": "validated",
+      "verification_method": "Trace overall/metrics to const arrays; no eval harness invocation",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "forensics",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0003",
+      "text": "computeFit is an illustrative client formula, not the production Fit Engine (A4) with calibration and MTLResource counting.",
+      "source": "computeFit in OptiQ Lab.dc.html:L642-680; redesign \u00a76.2 A4",
+      "risk": "HIGH",
+      "status": "validated",
+      "verification_method": "Read formula; confirm no calibration pass or empirical ceiling map in code",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "deepdive",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0004",
+      "text": "Standalone browser open requires network access to unpkg for React 18.3.1 unless window.__resources injects blobs.",
+      "source": "support.js CDN section L1143-1152",
+      "risk": "MEDIUM",
+      "status": "unvalidated",
+      "verification_method": "Open page with network blocked; observe React load failure; or inspect Network tab for unpkg",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": null,
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0005",
+      "text": "The production Lab currently ships as Flask multipage tabs on :7860 with mlx_lm.server on :8080 as described in the redesign brief.",
+      "source": "uploads/optiq-lab-ux-redesign.md \u00a71.1",
+      "risk": "MEDIUM",
+      "status": "unvalidated",
+      "verification_method": "Open mlx-optiq production repo and confirm optiq.lab.create_app, ports, process model",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": null,
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0006",
+      "text": "Target production architecture is React SPA + FastAPI (or serve stack) with SQLite spine and job bus (redesign A1\u2013A3), not permanent reliance on dc-runtime HTML.",
+      "source": "redesign \u00a76.2 A1\u2013A3",
+      "risk": "HIGH",
+      "status": "validated",
+      "verification_method": "Phase 0 plan: editable worktree from pip 0.4.7; stack remains Flask+SQLite spine; React SPA deferred",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "user-decision-2026-08-02",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0007",
+      "text": "Multi-model residency (Arena as mode, dual eval) is undecided vs sequential queueing \u2014 redesign \u00a76.7 decision 1 still open.",
+      "source": "redesign \u00a76.7",
+      "risk": "HIGH",
+      "status": "validated",
+      "verification_method": "User chose sequential-only multi-model residency for Phase 0 job bus",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "user-decision-2026-08-02",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0008",
+      "text": "Workspace coherence rules (model + eval set + files + tools cannot silently disagree) are undecided \u2014 redesign \u00a76.7 decision 2.",
+      "source": "redesign \u00a76.7",
+      "risk": "MEDIUM",
+      "status": "validated",
+      "verification_method": "User chose coherent workspace ownership in Phase 0 schema",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "user-decision-2026-08-02",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0009",
+      "text": "Organic design system export is intentionally partial (CSS + manifest only); component HTML pages are not required to run the prototype.",
+      "source": "_ds listing; manifest cards missing on disk",
+      "risk": "LOW",
+      "status": "unvalidated",
+      "verification_method": "Confirm prototype renders with only styles.css linked",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": null,
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0010",
+      "text": "sendMessage empty body is intentional demo stub, not a regression.",
+      "source": "comment: demo composer \u2014 non-persisting in this prototype",
+      "risk": "MEDIUM",
+      "status": "validated",
+      "verification_method": "Read L616 comment and empty arrow function",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "forensics",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0011",
+      "text": "MACHINE.totalRamGB=64 and reservedGB=9.2 represent a fictional demo machine, not the host Mac's actual free unified memory.",
+      "source": "MACHINE const L568",
+      "risk": "MEDIUM",
+      "status": "validated",
+      "verification_method": "No OS memory API calls in script; constants only",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "code-read",
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0012",
+      "text": "This prototype was authored for a design-tool host (dc-runtime parent postMessage) and may behave differently outside that host.",
+      "source": "support.js design-mode postMessage; GENERATED header",
+      "risk": "LOW",
+      "status": "unvalidated",
+      "verification_method": "Open standalone vs design host; compare boot logs",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": null,
+      "invalidated_reason": null
+    },
+    {
+      "id": "A-0013",
+      "text": "Phase 0 implementation works from editable worktree bootstrapped from pip-installed mlx-optiq 0.4.7 because no upstream git checkout is available.",
+      "source": "user: pip on conda; plan 2026-08-02-phase-0-spine",
+      "risk": "MEDIUM",
+      "status": "validated",
+      "verification_method": "Task 0 creates mlx-optiq-dev and import path points there",
+      "created_at": "2026-08-02T00:00:00Z",
+      "last_reviewed_at": "2026-08-02T00:00:00Z",
+      "validated_by": "user+plan",
+      "invalidated_reason": null
+    }
+  ]
+}

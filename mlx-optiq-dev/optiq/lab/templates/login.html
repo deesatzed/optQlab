@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ page_title }} · OptiQ Lab</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
+<link rel="preload" as="font" type="font/woff2" crossorigin
+      href="{{ url_for('static', filename='fonts/inter-tight-regular-400.woff2') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/lab.min.css') }}">
+</head>
+<body>
+
+<main class="auth-page">
+  <div class="auth-card">
+    <div class="auth-brand"><span class="dot"></span>OptiQ <em style="font-style: italic; font-weight: 500;">Lab</em></div>
+    <div class="auth-sub">Enter your password to continue.</div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, msg in messages %}
+        <div class="flash flash-{{ category }}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    <form method="post" action="{{ url_for('auth.login') }}">
+      <div class="form-row">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autofocus required>
+      </div>
+      <button type="submit" class="btn">Sign in</button>
+    </form>
+  </div>
+</main>
+
+</body>
+</html>

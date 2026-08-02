@@ -1,0 +1,548 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="finetuneWizard()" x-init="init()">
+  <span class="page-eyebrow">Workflow · fine-tune</span>
+  <h1 class="page-title">Fine-tune a LoRA</h1>
+  <p class="page-lead">
+    Apply a LoRA adapter on top of any OptiQ quant. Runs MLX-natively; takes
+    advantage of OptiQ's sensitivity data via rank-scaling.
+  </p>
+
+  <div style="display: flex; gap: 8px; margin-bottom: 24px; font-family: var(--mono); font-size: 11px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.08em;">
+    <template x-for="(s, i) in steps" :key="i">
+      <span :style="i === step ? 'color: var(--accent); font-weight: 500;' : (i < step ? 'color: var(--ink-2);' : '')">
+        <span x-text="(i+1) + '. ' + s"></span>
+        <template x-if="i < steps.length - 1"><span style="margin: 0 8px;">→</span></template>
+      </span>
+    </template>
+  </div>
+
+  {# Step 1: pick base #}
+  <div class="card" x-show="step === 0">
+    <h2 style="margin-top: 0;">Base model</h2>
+    <template x-if="!localModels.length">
+      <div class="empty"><h3>No local OptiQ quants yet</h3>
+        <div>Run a quantize first (<a href="{{ url_for('quantize.quantize_page') }}">Quantize</a>), then come back here.</div>
+      </div>
+    </template>
+    <template x-if="localModels.length">
+      <div>
+        <div class="form-row">
+          <label>OptiQ quant on disk</label>
+          <select x-model="modelDir">
+            <option value="">— select —</option>
+            <template x-for="m in localModels" :key="m.path">
+              <option :value="m.path" x-text="m.name + '  ·  ' + m.path"></option>
+            </template>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>…or a custom directory</label>
+          <input type="text" x-model="modelDir" placeholder="/abs/path/to/optiq_mixed">
+        </div>
+        <button class="btn" :disabled="!modelDir.trim()" @click="step = 1">Continue</button>
+      </div>
+    </template>
+  </div>
+
+  {# Step 2: dataset #}
+  <div class="card" x-show="step === 1">
+    <h2 style="margin-top: 0;">Dataset</h2>
+    <p style="color: var(--mute); font-size: 13px;">
+      Path to a directory containing <code>train.jsonl</code> (and optionally
+      <code>valid.jsonl</code>). mlx-lm accepts the standard shapes:
+      <code>{"text": ...}</code>, <code>{"prompt": ..., "completion": ...}</code>,
+      or <code>{"messages": [...]}</code>.
+    </p>
+    <div class="form-row">
+      <label>Dataset directory</label>
+      <input type="text" x-model="dataDir" placeholder="/abs/path/to/dataset" @input="datasetInfo=null">
+    </div>
+    <button class="btn btn-ghost" :disabled="!dataDir.trim()" @click="inspectDataset()">Inspect</button>
+
+    <template x-if="datasetInfo && datasetInfo.ok">
+      <div class="flash flash-ok" style="margin-top: 12px;">
+        <strong x-text="datasetInfo.n_train"></strong> train rows
+        <template x-if="datasetInfo.n_valid"><span> · <strong x-text="datasetInfo.n_valid"></strong> valid rows</span></template>
+        · format <strong x-text="datasetInfo.format"></strong>
+      </div>
+    </template>
+    <template x-if="datasetInfo && !datasetInfo.ok">
+      <div class="flash flash-err" style="margin-top: 12px;" x-text="datasetInfo.error"></div>
+    </template>
+
+    <div style="margin-top: 16px; display: flex; gap: 8px;">
+      <button class="btn btn-ghost" @click="step = 0">Back</button>
+      <button class="btn" :disabled="!datasetInfo || !datasetInfo.ok" @click="step = 2">Continue</button>
+    </div>
+  </div>
+
+  {# Step 3: hyperparams #}
+  <div class="card" x-show="step === 2">
+    <h2 style="margin-top: 0;">Hyperparameters</h2>
+
+    <div class="form-row" style="margin: 0 0 16px;">
+      <label>Training objective</label>
+      <select x-model="method" @change="onMethodChange()">
+        <option value="sft">SFT, supervised fine-tuning (default; data is messages or prompt+completion)</option>
+        <option value="dpo">DPO, Direct Preference Optimization (data is {prompt, chosen, rejected})</option>
+        <option value="vision">Vision, image+text LoRA (data is {image, prompt, completion})</option>
+      </select>
+      <div x-show="method === 'vision'" style="margin-top: 8px; padding: 10px 12px; background: #eef6f1; border-left: 3px solid var(--accent, #03684c); border-radius: 4px; font-size: 12.5px; line-height: 1.5; color: #214c3c;">
+        <strong>Vision LoRA.</strong> The frozen vision tower encodes each image into soft tokens; LoRA trains only the language tower with gradient checkpointing on. Build the dataset with the <em>VLM image+text</em> template so every image is letterboxed to one uniform canvas. Uniform image shape is what keeps training memory bounded on Apple Silicon. Scale defaults to 8 (the Qwen3.5/3.6 hybrid family collapses at 20).
+      </div>
+      <div class="form-row" x-show="method === 'vision'" style="margin: 8px 0 0;">
+        <label>Image canvas (px square)</label>
+        <input type="number" min="256" max="1024" step="64" x-model.number="imageSize">
+      </div>
+      <div class="hint" x-show="method === 'dpo'" style="margin-top: 4px; color: var(--mute); font-size: 12px;">
+        DPO reuses the adapted model with adapter scale temporarily zeroed for the reference forward pass, so there is no second model load.
+      </div>
+      <div x-show="method === 'dpo'" style="margin-top: 8px; padding: 10px 12px; background: #fff8e6; border-left: 3px solid #d99a00; border-radius: 4px; font-size: 12.5px; line-height: 1.5; color: #5a4400;">
+        <strong>DPO defaults differ from SFT.</strong> Learning rate 5e-5 (about 4x lower than SFT), 10% warmup, cosine decay. Without warmup and the lower LR, the first preference-loss steps blow out the reward margin and training collapses to loss=0 with both rewards drifting to -hundreds. Bump LR cautiously.
+        Also confirm that <em>chosen</em> and <em>rejected</em> are both valid completions of the same <em>prompt</em>, otherwise DPO has no signal to learn from.
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+      <div class="form-row" style="margin: 0;"><label>Rank</label>
+        <input type="number" min="1" max="128" x-model.number="rank"></div>
+      <div class="form-row" style="margin: 0;"><label>Scale (alpha = rank × scale)</label>
+        <input type="number" step="0.5" min="0" x-model.number="scale"></div>
+      <div class="form-row" style="margin: 0;"><label>Dropout</label>
+        <input type="number" step="0.01" min="0" max="0.5" x-model.number="dropout"></div>
+      <div class="form-row" style="margin: 0;"><label>Rank scaling</label>
+        <select x-model="rankScaling">
+          <option value="constant">constant: same rank everywhere</option>
+          <option value="by_bits">by_bits: higher rank on lower-bit layers (recommended)</option>
+          <option value="by_kl">by_kl: proportional to per-layer KL</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin: 0;"><label>Target modules</label>
+        <input type="text" x-model="targetModulesText" placeholder="q_proj,v_proj"></div>
+      <div class="form-row" style="margin: 0;"><label>num_layers (-1 = all; risky on big models)</label>
+        <input type="number" min="-1" x-model.number="numLayers"></div>
+      <div class="form-row" style="margin: 0;"><label>epochs <span style="color: var(--mute); font-weight: normal;">(blank = 3 SFT / 1 DPO)</span></label>
+        <input type="number" min="0" step="0.5" x-model.number="numEpochs" placeholder="auto"></div>
+      <div class="form-row" style="margin: 0;"><label>iters <span style="color: var(--mute); font-weight: normal;">(override epochs)</span></label>
+        <input type="number" min="10" x-model.number="iters" placeholder="auto"></div>
+      <div class="form-row" style="margin: 0;"><label>batch_size</label>
+        <input type="number" min="1" max="16" x-model.number="batchSize"></div>
+      <div class="form-row" style="margin: 0;">
+        <label>learning rate <span x-show="method === 'dpo'" style="color: var(--mute); font-weight: normal;">(DPO default 5e-5)</span></label>
+        <input type="number" step="0.00001" min="0" x-model.number="learningRate" @input="lrTouched = true">
+      </div>
+      <div class="form-row" style="margin: 0;"><label>max_seq_length</label>
+        <input type="number" min="128" x-model.number="maxSeqLength"></div>
+      <div class="form-row" style="margin: 0;" x-show="method === 'dpo'">
+        <label>DPO beta (KL constraint strength)</label>
+        <input type="number" step="0.01" min="0.01" max="1.0" x-model.number="dpoBeta"></div>
+      <div class="form-row" style="margin: 0;" x-show="method === 'dpo'">
+        <label>DPO loss</label>
+        <select x-model="dpoLoss"><option value="sigmoid">sigmoid (standard)</option><option value="ipo">ipo (bounded margin)</option></select></div>
+      <div class="form-row" style="margin: 0;" x-show="method === 'dpo' && dpoLoss === 'sigmoid'">
+        <label>label smoothing <span style="color: var(--mute); font-weight: normal;">(cDPO; 0.1-0.3 stops small-data collapse)</span></label>
+        <input type="number" step="0.05" min="0" max="0.5" x-model.number="dpoLabelSmoothing">
+      </div>
+      <div class="form-row" style="margin: 0;" x-show="method === 'dpo'">
+        <label><input type="checkbox" x-model="fusedDpo" style="width:auto;margin-right:6px;">fused DPO logp <span style="color: var(--mute); font-weight: normal;">(chunked head; needed for &gt;4k context, ~4k is the practical DPO ceiling on 24GB)</span></label>
+      </div>
+    </div>
+    <div style="margin-top: 16px; display: flex; gap: 8px;">
+      <button class="btn btn-ghost" @click="step = 1">Back</button>
+      <button class="btn" @click="submit()">Start training</button>
+    </div>
+  </div>
+
+  {# Step 4: live training #}
+  <div class="card" x-show="step === 3">
+    <h2 style="margin-top: 0;">Training</h2>
+    <div style="margin-bottom: 12px;">
+      <div style="height: 8px; background: var(--paper-3); border-radius: 4px; overflow: hidden;">
+        <div style="height: 100%; background: var(--accent); transition: width 0.4s;"
+             :style="'width: ' + Math.round((progress || 0) * 100) + '%;'"></div>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--mute); margin-top: 6px;">
+        <span x-text="message || 'Starting…'"></span>
+        <span x-text="Math.round((progress || 0) * 100) + '%'"></span>
+      </div>
+    </div>
+
+    {# Loss chart — minimal SVG sparkline #}
+    <template x-if="trainPoints.length">
+      <div style="margin: 16px 0;">
+        <div class="side-label" style="margin-bottom: 4px;">Train loss</div>
+        <svg :viewBox="'0 0 ' + Math.max(trainPoints.length, 100) + ' 100'" style="width: 100%; height: 120px; background: var(--paper-2); border-radius: 4px;" preserveAspectRatio="none">
+          <polyline fill="none" stroke="var(--accent)" stroke-width="0.8"
+                    :points="lossPolyline()"></polyline>
+        </svg>
+        <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--mute); margin-top: 2px;">
+          <span x-text="'step 0'"></span>
+          <span x-text="'step ' + trainPoints.at(-1)?.step + '  ·  loss ' + trainPoints.at(-1)?.loss.toFixed(3)"></span>
+        </div>
+      </div>
+    </template>
+
+    <pre x-ref="logEl" style="max-height: 280px; overflow-y: auto; font-size: 11.5px;"
+         x-text="logLines.slice(-200).join('\n')"></pre>
+  </div>
+
+  {# Step 5: combine + export + push #}
+  <div class="card" x-show="step === 4">
+    <h2 style="margin-top: 0;">Done</h2>
+    <p>LoRA adapter saved to:</p>
+    <pre x-text="adapterPath"></pre>
+
+    <h3 style="margin-top: 24px;">Combine with another adapter</h3>
+    <p class="hint" style="color: var(--mute); font-size: 13px; margin-bottom: 12px;">
+      Common case: this is a DPO adapter trained with <code>--mount-adapter</code> on top of an SFT. Merge them
+      here so the final artifact is a single drop-in adapter (rank-concat, mathematically exact).
+      Skip this section to ship the adapter alone.
+    </p>
+    <div class="form-row">
+      <label style="display: inline-flex; gap: 6px;">
+        <input type="checkbox" x-model="combineEnabled" @change="if (combineEnabled) loadCombineAdapters()">
+        Merge with another local adapter
+      </label>
+    </div>
+    <div x-show="combineEnabled" class="form-row" style="margin-top: 8px;">
+      <label>Second adapter (the SFT, usually)</label>
+      <select x-model="combineWith">
+        <option value="">— pick an adapter —</option>
+        <template x-for="a in combineAdapters" :key="a.path">
+          <option :value="a.path" x-text="a.path + '   (' + a.rank_dist + ')'"></option>
+        </template>
+      </select>
+    </div>
+    <div x-show="combineEnabled && combineResult && combineResult.ok"
+         class="flash flash-ok" style="margin-top: 8px;">
+      Merged → <code x-text="combineResult?.merged_path"></code>
+      (<span x-text="combineResult?.stats?.layers_merged"></span> layers rank-concat,
+      <span x-text="combineResult?.stats?.layers_only_in_one"></span> in only one source)
+    </div>
+    <div x-show="combineEnabled && combineResult && !combineResult.ok"
+         class="flash flash-err" style="margin-top: 8px;" x-text="combineResult?.error"></div>
+    <div x-show="combineEnabled" style="margin-top: 8px;">
+      <button class="btn btn-ghost" :disabled="combining || !combineWith"
+              @click="combineNow()">
+        <span x-text="combining ? 'Merging…' : 'Combine'"></span>
+      </button>
+    </div>
+
+    <h3 style="margin-top: 28px;">Bundle as a self-contained model</h3>
+    <p class="hint" style="color: var(--mute); font-size: 13px; margin-bottom: 12px;">
+      Optional: copy the base model files + this adapter into one directory ready for
+      <code>optiq serve --model &lt;dir&gt;</code> or stock <code>mlx_lm.generate</code>.
+      Larger payload but drop-in usable without any adapter flags.
+    </p>
+    <div class="form-row">
+      <label style="display: inline-flex; gap: 6px;">
+        <input type="checkbox" x-model="exportEnabled">
+        Export as model directory (bundles base model + adapter)
+      </label>
+    </div>
+    <div x-show="exportEnabled" class="form-row" style="margin-top: 8px;">
+      <label>Base model (HF id or local path)</label>
+      <input type="text" x-model="exportBaseModel"
+             placeholder="mlx-community/MiniCPM5-1B-OptiQ-4bit">
+    </div>
+    <div x-show="exportEnabled && exportResult && exportResult.ok"
+         class="flash flash-ok" style="margin-top: 8px;">
+      Exported → <code x-text="exportResult?.export_path"></code>
+    </div>
+    <div x-show="exportEnabled && exportResult && !exportResult.ok"
+         class="flash flash-err" style="margin-top: 8px;" x-text="exportResult?.error"></div>
+    <div x-show="exportEnabled" style="margin-top: 8px;">
+      <button class="btn btn-ghost" :disabled="exporting || !exportBaseModel.trim()"
+              @click="exportNow()">
+        <span x-text="exporting ? 'Exporting…' : 'Export model'"></span>
+      </button>
+    </div>
+
+    <h3 style="margin-top: 28px;">Push to Hugging Face</h3>
+    <p class="hint" style="color: var(--mute); font-size: 13px; margin-bottom: 12px;">
+      Pushes <span x-show="exportEnabled && exportResult && exportResult.ok"><b>the exported model directory</b></span><span
+        x-show="!(exportEnabled && exportResult && exportResult.ok) && combineEnabled && combineResult && combineResult.ok"><b>the merged adapter</b></span><span
+        x-show="!combineEnabled && !exportEnabled"><b>the trained adapter</b></span>.
+    </p>
+    <div class="form-row"><label>Repository</label>
+      <input type="text" x-model="repoId" placeholder="your-username/qwen-lora-mine"></div>
+    <div class="form-row">
+      <label style="display: inline-flex; gap: 6px;">
+        <input type="checkbox" x-model="repoPrivate"> Private
+      </label>
+    </div>
+    <div class="form-row"><label>Lab password</label>
+      <input type="password" x-model="pushPassword"></div>
+
+    <template x-if="pushResult && pushResult.ok">
+      <div class="flash flash-ok">Pushed: <a :href="pushResult.url" target="_blank" x-text="pushResult.url"></a></div>
+    </template>
+    <template x-if="pushResult && !pushResult.ok">
+      <div class="flash flash-err" x-text="pushResult.error"></div>
+    </template>
+
+    <div style="display: flex; gap: 8px;">
+      <button class="btn" :disabled="pushing || !repoId.trim() || !pushPassword" @click="push()">
+        <span x-text="pushing ? 'Pushing…' : 'Push to HF'"></span>
+      </button>
+      <a class="btn btn-ghost" href="{{ url_for('finetune.finetune_page') }}">Train another</a>
+    </div>
+  </div>
+</div>
+
+<script>
+function finetuneWizard() {
+  return {
+    step: 0,
+    steps: ['Base', 'Dataset', 'Hyperparams', 'Train', 'Save & push'],
+    localModels: {{ local_models | tojson }},
+
+    modelDir: '',
+    dataDir: '',
+    datasetInfo: null,
+    method: 'sft',
+    dpoBeta: 0.1, dpoLoss: 'sigmoid', dpoLabelSmoothing: 0.0,
+    // DPO-specific schedule knobs. ``null`` means take the
+    // ``OptiqLoraConfig.resolve_warmup_iters`` default (10% of iters,
+    // floor 10). dpoLrSchedule defaults to cosine.
+    dpoWarmupIters: null,
+    dpoLrSchedule: 'cosine',
+    // Track whether the user manually edited the LR field. Lets us
+    // swap the LR default in when method flips to DPO without
+    // clobbering an explicit choice.
+    lrTouched: false,
+    rank: 8, scale: 20.0, dropout: 0.0,
+    rankScaling: 'by_bits',
+    targetModulesText: 'q_proj,v_proj',
+    numLayers: 16,
+    iters: null, numEpochs: null, fusedDpo: false, batchSize: 1,
+    learningRate: 0.0002, maxSeqLength: 1024,
+    imageSize: 512,
+
+    jobId: null,
+    progress: 0, message: '',
+    logLines: [], trainPoints: [], valPoints: [],
+    adapterPath: '',
+
+    repoId: '', repoPrivate: true, pushPassword: '',
+    pushing: false, pushResult: null,
+
+    // Combine + export state (Step 5)
+    combineEnabled: false,
+    combineWith: '',
+    combineAdapters: [],
+    combining: false,
+    combineResult: null,
+    exportEnabled: false,
+    exportBaseModel: '',
+    exporting: false,
+    exportResult: null,
+
+    init() {
+      const params = new URLSearchParams(window.location.search);
+      const jid = params.get('job_id');
+      if (jid) {
+        this.jobId = jid;
+        this.step = 3;
+        this.attachStream();
+      }
+    },
+
+    // Swap the LR default when the user toggles between SFT and DPO,
+    // unless they have already edited the LR field. Mirrors what
+    // OptiqLoraConfig.resolve_learning_rate does in the CLI / trainer.
+    onMethodChange() {
+      // Vision LoRA: the hybrid family collapses at scale 20; default to 8.
+      if (this.method === 'vision' && this.scale === 20.0) this.scale = 8.0;
+      if (this.lrTouched) return;
+      this.learningRate = (this.method === 'dpo') ? 0.00005 : 0.0002;
+    },
+
+    async inspectDataset() {
+      this.datasetInfo = null;
+      const r = await fetch('/api/finetune/inspect-dataset', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: this.dataDir.trim()}),
+        credentials: 'same-origin',
+      });
+      this.datasetInfo = await r.json();
+    },
+
+    async submit() {
+      const r = await fetch('/api/finetune/submit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          model_dir: this.modelDir.trim(),
+          data_dir: this.dataDir.trim(),
+          method: this.method,
+          dpo_beta: this.dpoBeta,
+          dpo_loss: this.dpoLoss,
+          dpo_label_smoothing: this.dpoLabelSmoothing,
+          dpo_warmup_iters: this.dpoWarmupIters,
+          dpo_lr_schedule: this.dpoLrSchedule,
+          rank: this.rank, scale: this.scale, dropout: this.dropout,
+          rank_scaling: this.rankScaling,
+          target_modules: this.targetModulesText.split(',').map(s => s.trim()).filter(Boolean),
+          num_layers: this.numLayers,
+          iters: this.iters || null,
+          num_epochs: this.numEpochs || null,
+          batch_size: this.batchSize,
+          learning_rate: this.lrTouched ? this.learningRate : null,
+          fused_dpo: this.fusedDpo,
+          max_seq_length: this.maxSeqLength,
+          image_size: this.imageSize,
+        }),
+        credentials: 'same-origin',
+      });
+      const data = await r.json();
+      if (!data.ok) { alert(data.error); return; }
+      this.jobId = data.job_id;
+      this.adapterPath = data.adapter_path;
+      this.step = 3;
+      history.replaceState({}, '', '?job_id=' + this.jobId);
+      this.attachStream();
+    },
+
+    attachStream() {
+      if (!this.jobId) return;
+      const es = new EventSource('/api/jobs/' + this.jobId + '/stream');
+      es.onmessage = (ev) => {
+        try {
+          const e = JSON.parse(ev.data);
+          if (e.type === 'log') {
+            this.logLines.push(e.line);
+            this.$nextTick(() => { if (this.$refs.logEl) this.$refs.logEl.scrollTop = this.$refs.logEl.scrollHeight; });
+          } else if (e.type === 'metric') {
+            if (e.kind === 'train') {
+              this.trainPoints.push({step: e.step, loss: e.loss});
+              this.progress = e.progress || this.progress;
+              this.message = e.message || this.message;
+            } else if (e.kind === 'val') {
+              this.valPoints.push({step: e.step, loss: e.loss});
+            }
+          } else if (e.type === 'stage') {
+            this.progress = e.progress || this.progress;
+            this.message = e.message || this.message;
+            if (e.stage === 'done') {
+              this.adapterPath = e.adapter_path || this.adapterPath;
+              this.progress = 1;
+              this.step = 4;
+              es.close();
+            }
+          } else if (e.type === 'failed') {
+            this.message = 'Failed: ' + (e.error || 'unknown');
+            es.close();
+          }
+        } catch (err) {}
+      };
+      es.addEventListener('end', () => es.close());
+    },
+
+    lossPolyline() {
+      if (!this.trainPoints.length) return '';
+      const minL = Math.min(...this.trainPoints.map(p => p.loss));
+      const maxL = Math.max(...this.trainPoints.map(p => p.loss));
+      const range = Math.max(maxL - minL, 0.001);
+      const w = Math.max(this.trainPoints.length, 100);
+      return this.trainPoints.map((p, i) => {
+        const x = (i / Math.max(this.trainPoints.length - 1, 1)) * w;
+        const y = 100 - ((p.loss - minL) / range) * 95 - 2;
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ');
+    },
+
+    async push() {
+      this.pushing = true; this.pushResult = null;
+      // The /api/finetune/push handler will inspect this job_id and
+      // use the latest known artifact path: the exported model dir if
+      // exportResult.ok, otherwise the merged adapter if
+      // combineResult.ok, otherwise the trained adapter.
+      const r = await fetch('/api/finetune/push', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          job_id: this.jobId, repo_id: this.repoId.trim(),
+          private: this.repoPrivate, password: this.pushPassword,
+          source_path: (
+            (this.exportEnabled && this.exportResult && this.exportResult.ok)
+              ? this.exportResult.export_path
+              : (this.combineEnabled && this.combineResult && this.combineResult.ok)
+                  ? this.combineResult.merged_path
+                  : null
+          ),
+        }),
+        credentials: 'same-origin',
+      });
+      this.pushResult = await r.json();
+      this.pushing = false;
+    },
+
+    async loadCombineAdapters() {
+      // Pull the list of local adapters so the user can pick which to
+      // merge alongside this run's output.
+      try {
+        const r = await fetch('/api/finetune/list-adapters', {
+          credentials: 'same-origin',
+        });
+        const d = await r.json();
+        this.combineAdapters = (d.adapters || [])
+          // exclude the current run's own adapter
+          .filter(a => a.path !== this.adapterPath);
+      } catch (e) {
+        this.combineAdapters = [];
+      }
+    },
+
+    async combineNow() {
+      this.combining = true; this.combineResult = null;
+      try {
+        const r = await fetch('/api/finetune/merge', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            adapter_a: this.adapterPath,
+            adapter_b: this.combineWith,
+          }),
+          credentials: 'same-origin',
+        });
+        this.combineResult = await r.json();
+      } catch (e) {
+        this.combineResult = {ok: false, error: String(e)};
+      } finally {
+        this.combining = false;
+      }
+    },
+
+    async exportNow() {
+      this.exporting = true; this.exportResult = null;
+      // If the user enabled the merge above and it succeeded, ship the
+      // merged adapter; otherwise ship just this run's adapter.
+      const adapter_path = (
+        this.combineEnabled && this.combineResult && this.combineResult.ok
+          ? this.combineResult.merged_path
+          : this.adapterPath
+      );
+      try {
+        const r = await fetch('/api/finetune/export', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            base_model: this.exportBaseModel.trim(),
+            adapter_path: adapter_path,
+          }),
+          credentials: 'same-origin',
+        });
+        this.exportResult = await r.json();
+      } catch (e) {
+        this.exportResult = {ok: false, error: String(e)};
+      } finally {
+        this.exporting = false;
+      }
+    },
+  };
+}
+</script>
+{% endblock %}

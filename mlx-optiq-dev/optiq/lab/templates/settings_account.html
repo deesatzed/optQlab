@@ -1,0 +1,62 @@
+{% extends "_base.html" %}
+{% block content %}
+<span class="page-eyebrow">Settings · Account</span>
+<h1 class="page-title">Account</h1>
+<p class="page-lead">
+  Change your Lab password, view the install metadata, and see the on-disk state
+  the Lab keeps for you.
+</p>
+
+<div class="card">
+  <h2 style="margin-top: 0;">Change password</h2>
+  <p style="color: var(--mute); font-size: 13px; margin-bottom: 16px;">
+    Saved Hugging Face tokens get re-encrypted with the new password automatically.
+    After change you'll be signed out.
+  </p>
+  <form method="post" action="{{ url_for('settings.change_password') }}">
+    <div class="form-row">
+      <label>Current password</label>
+      <input type="password" name="old_password" required autocomplete="current-password">
+    </div>
+    <div class="form-row">
+      <label>New password</label>
+      <input type="password" name="new_password" required minlength="8" autocomplete="new-password">
+      <div class="hint">8 characters minimum.</div>
+    </div>
+    <div class="form-row">
+      <label>Confirm new password</label>
+      <input type="password" name="new_password_confirm" required minlength="8" autocomplete="new-password">
+    </div>
+    <button type="submit" class="btn">Change password</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top: 0;">About this install</h2>
+  <table class="tbl" style="font-size: 14px;">
+    <tbody>
+      <tr><td style="color: var(--mute); width: 200px;">mlx-optiq version</td><td><code>{{ optiq_version }}</code></td></tr>
+      <tr><td style="color: var(--mute);">Python</td><td><code>{{ python_version }}</code></td></tr>
+      <tr><td style="color: var(--mute);">SQLite</td><td><code>{{ sqlite_version }}</code></td></tr>
+      <tr><td style="color: var(--mute);">OS</td><td><code>{{ os_label }}</code></td></tr>
+      <tr><td style="color: var(--mute);">Lab data dir</td><td><code>{{ lab_root }}</code></td></tr>
+      <tr><td style="color: var(--mute);">Password set</td><td><code>{{ password_created or '—' }}</code> UTC</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2 style="margin-top: 0;">What's stored</h2>
+  <table class="tbl" style="font-size: 14px;">
+    <tbody>
+      <tr><td style="color: var(--mute); width: 200px;">Background jobs (total)</td><td>{{ n_jobs }}</td></tr>
+      <tr><td style="color: var(--mute);">Local OptiQ quants tracked</td><td>{{ n_models }}</td></tr>
+      <tr><td style="color: var(--mute);">Hugging Face tokens saved</td><td>{{ n_tokens }}</td></tr>
+    </tbody>
+  </table>
+  <p style="color: var(--mute); font-size: 13px; margin-top: 16px;">
+    To clear everything, stop <code>optiq lab</code> and delete <code>{{ lab_root }}</code>.
+    The next launch starts fresh.
+  </p>
+</div>
+{% endblock %}

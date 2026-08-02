@@ -1,0 +1,285 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="quantizeWizard()" x-init="init()">
+  <span class="page-eyebrow">Workflow · quantize</span>
+  <h1 class="page-title">Quantize a model</h1>
+  <p class="page-lead">
+    Pick a Hugging Face model, choose a target average bits-per-weight,
+    and OptiQ picks per-layer precision from a sensitivity sweep.
+  </p>
+
+  {# Step indicator #}
+  <div style="display: flex; gap: 8px; margin-bottom: 24px; font-family: var(--mono); font-size: 11px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.08em;">
+    <template x-for="(s, i) in steps" :key="i">
+      <span :style="i === step ? 'color: var(--accent); font-weight: 500;' : (i < step ? 'color: var(--ink-2);' : '')">
+        <span x-text="(i+1) + '. ' + s"></span>
+        <template x-if="i < steps.length - 1"><span style="margin: 0 8px;">→</span></template>
+      </span>
+    </template>
+  </div>
+
+  {# Step 1: Source #}
+  <div class="card" x-show="step === 0">
+    <h2 style="margin-top: 0;">Source model</h2>
+    <div class="form-row">
+      <label>Hugging Face model id</label>
+      <input type="text" x-model="modelId" placeholder="Qwen/Qwen3.5-9B" @input="inspect_=null">
+      <div class="hint">Anything on huggingface.co. We support Qwen3.5 / 3.6 and Gemma-4 explicitly; other architectures may work but aren't tested.</div>
+    </div>
+    <button class="btn btn-ghost" :disabled="!modelId.trim()" @click="inspect()">Inspect</button>
+
+    <template x-if="inspect_ && inspect_.ok">
+      <div style="margin-top: 14px;">
+        <div :class="inspect_.support === 'supported' ? 'flash flash-ok'
+                     : (inspect_.support === 'untested' ? 'flash flash-warn' : 'flash flash-err')">
+          <template x-if="inspect_.support === 'supported'">
+            <span><strong x-text="inspect_.arch_label"></strong> · <span x-text="inspect_.arch"></span> · <span x-text="inspect_.size_gb + ' GB'"></span>
+              <template x-if="inspect_.mtp_in_source">
+                <span> · <span style="font-weight: 500;">MTP head detected</span> (will be preserved by default)</span>
+              </template>
+            </span>
+          </template>
+          <template x-if="inspect_.support === 'untested'">
+            <span>Untested architecture <code x-text="inspect_.arch"></code> · <span x-text="inspect_.size_gb + ' GB'"></span> · proceed with caution</span>
+          </template>
+          <template x-if="inspect_.support === 'unknown'">
+            <span>Couldn't read config.json. The model may be private or non-standard.</span>
+          </template>
+        </div>
+        <button class="btn" style="margin-top: 12px;" @click="step = 1">Continue</button>
+      </div>
+    </template>
+    <template x-if="inspect_ && !inspect_.ok">
+      <div class="flash flash-err" style="margin-top: 14px;" x-text="inspect_.error"></div>
+    </template>
+  </div>
+
+  {# Step 2: Configure #}
+  <div class="card" x-show="step === 1">
+    <h2 style="margin-top: 0;">Configure</h2>
+    <div class="form-row">
+      <label>Target BPW: <strong x-text="targetBpw.toFixed(2)"></strong></label>
+      <input type="range" min="3" max="8" step="0.25" x-model.number="targetBpw" style="width: 100%;">
+      <div class="hint">3 bpw = small &amp; lossy · 5.0 bpw = balanced default · 8 bpw = near-lossless</div>
+    </div>
+    <div class="form-row">
+      <label>Reference mode</label>
+      <select x-model="reference">
+        <option value="auto">auto (recommended)</option>
+        <option value="bf16">bf16 (highest fidelity; needs RAM to hold bf16)</option>
+        <option value="uniform_4bit">uniform_4bit (low-RAM mode)</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>Calibration mix</label>
+      <select x-model="calibrationMix">
+        <option value="optiq">optiq: 40-sample pool across prose, thought, code, agent, tool, and instruct</option>
+      </select>
+      <div class="hint">The pool the per-layer KL probe samples from. Bigger pool = more diverse coverage; OptiQ ships a curated 40 to keep total runtime small.</div>
+    </div>
+    <div class="form-row">
+      <label>Calibration samples: <strong x-text="nCalibration"></strong></label>
+      <input type="range" min="2" max="40" step="1" x-model.number="nCalibration" style="width: 100%;">
+      <div class="hint">How many of the 40-sample pool to actually use. Each layer gets forward-passed against every sample × every candidate bit-width, so cost is <code>n_layers × n_bits × n_samples</code> forwards. 8 is the default (good signal/cost balance); 16+ shaves variance on noisy layers but doubles the wait.</div>
+    </div>
+    <div class="form-row">
+      <label>Candidate bit-widths</label>
+      <input type="text" x-model="candidateBitsText" placeholder="4,8">
+      <div class="hint">Comma-separated. The knapsack picks per-layer from this set. The lowest bit becomes the model's name suffix (e.g. <code>OptiQ-4bit</code>) following llama.cpp / Unsloth convention.</div>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <button class="btn btn-ghost" @click="step = 0">Back</button>
+      <button class="btn" @click="submit()">Start quantize</button>
+    </div>
+  </div>
+
+  {# Step 3: Run #}
+  <div class="card" x-show="step === 2">
+    <h2 style="margin-top: 0;">Running</h2>
+    <div style="margin-bottom: 12px;">
+      <div style="height: 8px; background: var(--paper-3); border-radius: 4px; overflow: hidden;">
+        <div style="height: 100%; background: var(--accent); transition: width 0.4s;"
+             :style="'width: ' + Math.round((progress || 0) * 100) + '%;'"></div>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--mute); margin-top: 6px;">
+        <span x-text="message || 'Starting…'"></span>
+        <span x-text="Math.round((progress || 0) * 100) + '%'"></span>
+      </div>
+    </div>
+    <pre x-ref="logEl" style="max-height: 360px; overflow-y: auto; font-size: 11.5px;"
+         x-text="logLines.slice(-200).join('\n')"></pre>
+  </div>
+
+  {# Step 4: Save / Push #}
+  <div class="card" x-show="step === 3">
+    <h2 style="margin-top: 0;">Done</h2>
+    <p>OptiQ quant saved to:</p>
+    <pre x-text="outputDir"></pre>
+
+    <h3>Push to Hugging Face</h3>
+    <p style="color: var(--mute); font-size: 13px;">
+      Uses the token from <a :href="'{{ url_for("settings.hf_index") }}'">Settings → Hugging Face</a>.
+      Requires your Lab password to decrypt.
+    </p>
+    <div class="form-row">
+      <label>Repository</label>
+      <input type="text" x-model="repoId" placeholder="your-username/qwen-mine-optiq-4.5bpw">
+    </div>
+    <div class="form-row">
+      <label style="display: inline-flex; gap: 6px;">
+        <input type="checkbox" x-model="repoPrivate"> Private
+      </label>
+    </div>
+    <div class="form-row">
+      <label>Lab password</label>
+      <input type="password" x-model="pushPassword">
+    </div>
+
+    <template x-if="pushResult && pushResult.ok">
+      <div class="flash flash-ok">Pushed: <a :href="pushResult.url" target="_blank" x-text="pushResult.url"></a></div>
+    </template>
+    <template x-if="pushResult && !pushResult.ok">
+      <div class="flash flash-err" x-text="pushResult.error"></div>
+    </template>
+
+    <div style="display: flex; gap: 8px;">
+      <button class="btn" @click="push()"
+              :disabled="pushing || !repoId.trim() || !pushPassword">
+        <span x-text="pushing ? 'Pushing…' : 'Push to HF'"></span>
+      </button>
+      <a class="btn btn-ghost" href="{{ url_for('quantize.quantize_page') }}">Quantize another</a>
+    </div>
+  </div>
+</div>
+
+<script>
+function quantizeWizard() {
+  return {
+    step: 0,
+    steps: ['Source', 'Configure', 'Run', 'Save & push'],
+
+    // Step 1
+    modelId: '',
+    inspect_: null,
+    // Step 2
+    targetBpw: 5.0,
+    reference: 'auto',
+    calibrationMix: 'optiq',
+    nCalibration: 8,
+    candidateBitsText: '4,8',
+    // Step 3
+    jobId: null,
+    progress: 0,
+    message: '',
+    logLines: [],
+    eventSource: null,
+    // Step 4
+    outputDir: '',
+    repoId: '',
+    repoPrivate: true,
+    pushPassword: '',
+    pushing: false,
+    pushResult: null,
+
+    init() {
+      // Survive page reload of an in-progress run via job_id query param
+      const params = new URLSearchParams(window.location.search);
+      const jid = params.get('job_id');
+      if (jid) {
+        this.jobId = jid;
+        this.step = 2;
+        this.attachStream();
+      }
+    },
+
+    async inspect() {
+      this.inspect_ = null;
+      const r = await fetch('/api/quantize/inspect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({model_id: this.modelId.trim()}),
+        credentials: 'same-origin',
+      });
+      this.inspect_ = await r.json();
+    },
+
+    async submit() {
+      const r = await fetch('/api/quantize/submit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          model_id: this.modelId.trim(),
+          target_bpw: this.targetBpw,
+          reference: this.reference,
+          calibration_mix: this.calibrationMix,
+          n_calibration: this.nCalibration,
+          candidate_bits: this.candidateBitsText.split(',').map(s => parseInt(s.trim())).filter(n => n > 0),
+        }),
+        credentials: 'same-origin',
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        alert(data.error || 'Submit failed');
+        return;
+      }
+      this.jobId = data.job_id;
+      this.outputDir = data.output_dir;
+      this.step = 2;
+      history.replaceState({}, '', '?job_id=' + this.jobId);
+      this.attachStream();
+    },
+
+    attachStream() {
+      if (!this.jobId) return;
+      const es = new EventSource('/api/jobs/' + this.jobId + '/stream');
+      this.eventSource = es;
+      es.onmessage = (ev) => {
+        try {
+          const e = JSON.parse(ev.data);
+          if (e.type === 'log') {
+            this.logLines.push(e.line);
+            this.$nextTick(() => { if (this.$refs.logEl) this.$refs.logEl.scrollTop = this.$refs.logEl.scrollHeight; });
+          } else if (e.type === 'stage') {
+            this.progress = e.progress || this.progress;
+            this.message = e.message || this.message;
+            if (e.stage === 'done') {
+              this.outputDir = e.output_dir || this.outputDir;
+              this.progress = 1;
+              this.step = 3;
+              es.close();
+            }
+          } else if (e.type === 'failed') {
+            this.message = 'Failed: ' + (e.error || 'unknown error');
+            this.progress = 1;
+            es.close();
+          } else if (e.type === 'done') {
+            this.progress = 1;
+            this.step = 3;
+            es.close();
+          }
+        } catch (err) {}
+      };
+      es.addEventListener('end', () => es.close());
+    },
+
+    async push() {
+      this.pushing = true;
+      this.pushResult = null;
+      const r = await fetch('/api/quantize/push', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          job_id: this.jobId,
+          repo_id: this.repoId.trim(),
+          private: this.repoPrivate,
+          password: this.pushPassword,
+        }),
+        credentials: 'same-origin',
+      });
+      this.pushResult = await r.json();
+      this.pushing = false;
+    },
+  };
+}
+</script>
+{% endblock %}

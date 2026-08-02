@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- warm paper background, rounded -->
+  <rect width="64" height="64" rx="14" fill="#f6f2ea"/>
+  <!-- italic Fraunces Q in deep emerald -->
+  <text x="32" y="50" font-family="Fraunces, 'Times New Roman', serif"
+        font-size="56" font-style="italic" font-weight="500"
+        fill="#03684c" text-anchor="middle" letter-spacing="-2">Q</text>
+</svg>

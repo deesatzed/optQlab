@@ -1,0 +1,5432 @@
+"""Reference AR and native-MTP generation loops.
+
+These loops intentionally favor correctness and observability over speed. The
+optimized runtime can tighten the same contracts after the MTP-1 gates pass.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import json
+import os
+import sys
+import time
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Literal
+
+import mlx.core as mx
+import numpy as np
+
+from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from .attention_context import attention_phase
+from .cache_state import (
+    detach_array_leaf,
+    detach_cache_state,
+    owned_recurrent_state_stats,
+    restore_cache,
+    rollback_after_verify,
+    snapshot_cache,
+    snapshot_untrimmable_cache,
+    tail_owned_attention_kv_stats,
+)
+from .fast_sampling import (
+    BatchedSparseDistributions,
+    batched_sparse_distributions_from_mlx_logits,
+    sparse_distribution_from_mlx_logits,
+    sparse_distributions_from_mlx_logits,
+)
+from .gdn_capture import resolve_gdn_capture_backend
+from .graphbank import SpecDecodeGraphBank, cache_array_tree, promote_kv_cache_offsets
+from .native_mlp import set_native_mlp_context
+from .profiles import resolve_long_context_mtp_depth
+from .runtime import MTPLXRuntime
+from .sampling import (
+    SamplerConfig,
+    SparseDistribution,
+    acceptance_probability as compute_acceptance_probability,
+    distribution_from_logits as dense_distribution_from_logits,
+    residual_distribution,
+    sample_from_distribution,
+)
+
+Mode = Literal["ar", "mtp1", "mtpk", "mtpa"]
+VerifyStrategy = Literal[
+    "batched",
+    "sequential",
+    "capture",
+    "capture_commit",
+    "graphbank",
+    "graphbank_capture_commit",
+]
+
+
+def _eval_value_summary(value: Any) -> dict[str, Any]:
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return {
+            "type": "array",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+    if isinstance(value, dict):
+        return {
+            "type": "dict",
+            "keys": [str(key) for key in value.keys()],
+            "items": {str(key): _eval_value_summary(item) for key, item in value.items()},
+        }
+    if isinstance(value, (list, tuple)):
+        return {
+            "type": type(value).__name__,
+            "items": [_eval_value_summary(item) for item in value],
+        }
+    return {"type": type(value).__name__}
+
+
+def _eval(*values: Any, _caller_depth: int = 1) -> None:
+    audit_path = os.environ.get("MTPLX_EVAL_AUDIT")
+    if not audit_path:
+        mx.eval(*values)
+        return
+
+    try:
+        caller = sys._getframe(_caller_depth)
+    except ValueError:
+        caller = None
+    started = time.perf_counter()
+    mx.eval(*values)
+    elapsed_s = time.perf_counter() - started
+    entry = {
+        "elapsed_s": elapsed_s,
+        "function": caller.f_code.co_name if caller is not None else None,
+        "line": caller.f_lineno if caller is not None else None,
+        "values": [_eval_value_summary(value) for value in values],
+    }
+    out = Path(audit_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    if os.environ.get("MTPLX_EVAL_AUDIT_STDERR"):
+        print(json.dumps(entry, sort_keys=True), file=sys.stderr)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _env_falsey(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _normalize_mtp_history_policy(policy: str | None) -> str:
+    normalized = (policy or "cycle").strip().lower().replace("-", "_")
+    aliases = {
+        "full": "committed",
+        "lastwindow": "last_window",
+        "window": "last_window",
+        "none": "cycle",
+        "off": "cycle",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"auto", "cycle", "committed", "last_window"}:
+        raise ValueError(
+            "mtp_history_policy must be 'auto', 'cycle', 'committed', "
+            "'full', 'last_window', or 'none'"
+        )
+    return normalized
+
+
+def _mtp_history_uses_committed_cache(policy: str) -> bool:
+    return _normalize_mtp_history_policy(policy) in {"committed", "last_window"}
+
+
+def _mtp_history_last_window_tokens() -> int:
+    return max(1, _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW", 8192))
+
+
+def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> str:
+    requested = _normalize_mtp_history_policy(requested_policy)
+    env_policy = os.environ.get("MTPLX_MTP_HISTORY_POLICY")
+    # Honor the env-var override whenever the caller requested either the
+    # default "committed" or the auto-resolution path. Previously this only
+    # fired when ``requested == "committed"``, which silently dropped the
+    # override in every server hot path that resolves to "auto" via the
+    # sustained profile (profiles.py:93). Sustained users could not opt
+    # out of the last_window flip without editing the profile.
+    if env_policy and requested in ("committed", "auto"):
+        requested = _normalize_mtp_history_policy(env_policy)
+    if requested != "auto":
+        return requested
+    threshold = max(
+        1,
+        _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD", 16384),
+    )
+    return "last_window" if int(prompt_tokens) >= threshold else "committed"
+
+
+def _runtime_count(rt: MTPLXRuntime, key: str, amount: int = 1) -> None:
+    counters = getattr(rt, "diagnostic_counters", None)
+    if counters is None:
+        return
+    counters[key] = int(counters.get(key, 0)) + int(amount)
+
+
+def _runtime_counter_snapshot(rt: MTPLXRuntime) -> dict[str, int]:
+    return {
+        str(key): int(value)
+        for key, value in getattr(rt, "diagnostic_counters", {}).items()
+    }
+
+
+def _runtime_counter_delta(
+    rt: MTPLXRuntime,
+    before: dict[str, int],
+) -> dict[str, int]:
+    current = getattr(rt, "diagnostic_counters", {})
+    keys = set(before) | set(current)
+    return {
+        str(key): int(current.get(key, 0)) - int(before.get(key, 0))
+        for key in keys
+    }
+
+
+def _attach_runtime_diagnostics(
+    stats: "GenerationStats",
+    rt: MTPLXRuntime,
+    before: dict[str, int],
+    *,
+    ar_return_hidden: bool | None = None,
+) -> None:
+    counters = _runtime_counter_delta(rt, before)
+    stats.runtime_mtp_enabled = bool(getattr(rt, "mtp_enabled", False))
+    if ar_return_hidden is not None:
+        stats.ar_return_hidden = bool(ar_return_hidden)
+    stats.forward_ar_hidden_calls = int(counters.get("forward_ar_hidden_calls", 0))
+    stats.forward_ar_plain_calls = int(counters.get("forward_ar_plain_calls", 0))
+    stats.mtp_forward_calls = int(counters.get("draft_mtp_calls", 0))
+    stats.make_mtp_cache_calls = int(counters.get("make_mtp_cache_calls", 0))
+    stats.update_mtp_cache_calls = int(counters.get("update_mtp_cache_calls", 0))
+    stats.mtp_history_append_calls = int(counters.get("mtp_history_append_calls", 0))
+    stats.full_logits_tokens_emitted = int(counters.get("full_logits_tokens_emitted", 0))
+    stats.final_logits_tokens_emitted = int(counters.get("final_logits_tokens_emitted", 0))
+    stats.logits_tokens_emitted = int(counters.get("logits_tokens_emitted", 0))
+    stats.prefill_chunks = int(counters.get("prefill_chunks", 0))
+    stats.prefill_chunk_size = _prefill_chunk_size()
+    stats.prefill_chunk_cache_cleanup_enabled = _prefill_chunk_cache_cleanup_enabled()
+    stats.prefill_chunk_cache_cleanup_every = _prefill_chunk_cache_cleanup_every()
+    stats.prefill_chunk_cache_cleanup_events = int(
+        counters.get("prefill_chunk_cache_cleanup_events", 0)
+    )
+    stats.prefill_stock_cache_only_enabled = _prefill_stock_cache_only_enabled()
+    stats.prefill_stock_cache_only_calls = int(
+        counters.get("prefill_stock_cache_only_calls", 0)
+    )
+    stats.prefill_omlx_external_enabled = _prefill_omlx_external_enabled()
+    stats.prefill_omlx_external_calls = int(
+        counters.get("prefill_omlx_external_calls", 0)
+    )
+    stats.prefill_external_emit_logits_enabled = (
+        _prefill_external_emit_logits_enabled()
+    )
+    stats.prefill_external_cache_only_calls = int(
+        counters.get("prefill_external_cache_only_calls", 0)
+    )
+    owned_attn = stats.owned_attn_kv if isinstance(stats.owned_attn_kv, dict) else {}
+    stats.paged_kv_capacity_tokens = int(owned_attn.get("capacity") or 0)
+    stats.paged_kv_num_blocks = int(owned_attn.get("num_blocks") or 0)
+    stats.paged_active_array_calls = int(owned_attn.get("active_array_calls") or 0)
+    stats.attention_dense_fallback_calls = int(
+        owned_attn.get("dense_fallback_calls") or 0
+    )
+    stats.prefill_dense_fallback_calls = int(
+        owned_attn.get("prefill_dense_fallback_calls") or 0
+    )
+    stats.decode_dense_fallback_calls = int(
+        owned_attn.get("decode_dense_fallback_calls") or 0
+    )
+    stats.ar_dense_fallback_calls = int(
+        owned_attn.get("ar_dense_fallback_calls") or 0
+    )
+    stats.postcommit_dense_fallback_calls = int(
+        owned_attn.get("postcommit_dense_fallback_calls") or 0
+    )
+    bailouts = owned_attn.get("paged_attention_bailouts_by_phase_reason") or {}
+    stats.paged_attention_bailouts_by_phase_reason = (
+        dict(bailouts) if isinstance(bailouts, dict) else {}
+    )
+    stats.paged_attention_large_q_path = str(
+        owned_attn.get("paged_attention_large_q_path") or ""
+    )
+    stats.prefill_route = (
+        _sustained_prefill_layout()
+        if _contiguous_prefill_cache_layout_enabled()
+        else stats.paged_attention_large_q_path
+    )
+    stats.large_q_split_sdpa_fallback_calls = int(
+        owned_attn.get("large_q_split_sdpa_fallback_calls") or 0
+    )
+    large_q_by_phase = (
+        owned_attn.get("large_q_split_sdpa_fallback_calls_by_phase") or {}
+    )
+    stats.large_q_split_sdpa_fallback_calls_by_phase = (
+        dict(large_q_by_phase) if isinstance(large_q_by_phase, dict) else {}
+    )
+    stats.prefill_large_q_split_sdpa_fallback_calls = int(
+        owned_attn.get("prefill_large_q_split_sdpa_fallback_calls") or 0
+    )
+    stats.decode_large_q_split_sdpa_fallback_calls = int(
+        owned_attn.get("decode_large_q_split_sdpa_fallback_calls") or 0
+    )
+    stats.partitioned_paged_calls = int(
+        owned_attn.get("partitioned_paged_calls") or 0
+    )
+    partitioned_by_phase = owned_attn.get("partitioned_paged_calls_by_phase") or {}
+    stats.partitioned_paged_calls_by_phase = (
+        dict(partitioned_by_phase) if isinstance(partitioned_by_phase, dict) else {}
+    )
+    stats.prefill_partitioned_paged_calls = int(
+        owned_attn.get("prefill_partitioned_paged_calls") or 0
+    )
+    stats.decode_partitioned_paged_calls = int(
+        owned_attn.get("decode_partitioned_paged_calls") or 0
+    )
+
+
+def _sustained_prefill_enabled() -> bool:
+    return _env_truthy("MTPLX_SUSTAINED_PREFILL")
+
+
+def _final_logits_prefill_enabled() -> bool:
+    return _sustained_prefill_enabled() or _env_falsey(
+        "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"
+    )
+
+
+def _prefill_chunk_cache_cleanup_enabled() -> bool:
+    return _env_truthy("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP")
+
+
+def _prefill_chunk_cache_cleanup_every() -> int:
+    raw = os.environ.get("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY")
+    if raw is None or not str(raw).strip():
+        return 1
+    raw_text = str(raw).strip().lower()
+    if raw_text == "auto":
+        return 2 if _sustained_prefill_layout() == "contiguous_then_repage" else 1
+    try:
+        return max(1, int(raw_text))
+    except ValueError:
+        return 1
+
+
+def _prefill_chunk_cache_cleanup(rt: MTPLXRuntime) -> float:
+    if not _prefill_chunk_cache_cleanup_enabled():
+        return 0.0
+    every = _prefill_chunk_cache_cleanup_every()
+    pending = int(
+        rt.diagnostic_counters.get("_prefill_chunks_since_cache_cleanup", 0)
+    ) + 1
+    rt.diagnostic_counters["_prefill_chunks_since_cache_cleanup"] = pending
+    if pending < every:
+        return 0.0
+    rt.diagnostic_counters["_prefill_chunks_since_cache_cleanup"] = 0
+    started = time.perf_counter()
+    try:
+        mx.synchronize()
+    except RuntimeError:
+        pass
+    mx.clear_cache()
+    _runtime_count(rt, "prefill_chunk_cache_cleanup_events")
+    return time.perf_counter() - started
+
+
+def _prefill_stock_cache_only_enabled() -> bool:
+    return _env_truthy("MTPLX_PREFILL_STOCK_CACHE_ONLY") and _env_truthy(
+        "MTPLX_ALLOW_UNSAFE_PREFILL_STOCK_CACHE_ONLY"
+    )
+
+
+def _unsafe_long_context_prefill_guard_tokens() -> int:
+    raw = os.environ.get("MTPLX_UNSAFE_LONG_CONTEXT_PREFILL_GUARD_TOKENS")
+    if raw is None or not str(raw).strip():
+        return 16384
+    try:
+        return max(0, int(str(raw).strip()))
+    except ValueError:
+        return 16384
+
+
+def _unsafe_long_context_prefill_allowed() -> bool:
+    return _env_truthy("MTPLX_ALLOW_UNSAFE_LONG_CONTEXT_PREFILL")
+
+
+def _assert_safe_long_context_prefill(prompt_tokens: int) -> None:
+    if _sustained_prefill_enabled() or _unsafe_long_context_prefill_allowed():
+        return
+    threshold = _unsafe_long_context_prefill_guard_tokens()
+    if threshold <= 0 or int(prompt_tokens) < threshold:
+        return
+    raise RuntimeError(
+        "Blocked unsafe long-context MTP prefill path: "
+        f"{int(prompt_tokens)} prompt tokens would use the non-Sustained full "
+        "hidden/logits prefill route. Start MTPLX with `--profile sustained` "
+        "or run `mtplx config set profile sustained`. To intentionally run "
+        "this diagnostic path, set MTPLX_ALLOW_UNSAFE_LONG_CONTEXT_PREFILL=1."
+    )
+
+
+def _prefill_omlx_external_enabled() -> bool:
+    return _env_truthy("MTPLX_PREFILL_OMLX_EXTERNAL")
+
+
+def _prefill_external_cache_only_enabled() -> bool:
+    return _prefill_omlx_external_enabled() or _prefill_stock_cache_only_enabled()
+
+
+def _prefill_external_emit_logits_enabled() -> bool:
+    return not _env_falsey("MTPLX_PREFILL_EXTERNAL_EMIT_LOGITS")
+
+
+def _batched_token_array(token_ids: Any) -> mx.array:
+    if hasattr(token_ids, "shape") and hasattr(token_ids, "dtype"):
+        if len(token_ids.shape) == 1:
+            return token_ids[None]
+        return token_ids
+    return mx.array([token_ids])
+
+
+def _prefill_cache_only_forward(rt: MTPLXRuntime, token_ids: Any, cache: Any) -> Any:
+    token_array = _batched_token_array(token_ids)
+    if not _prefill_external_cache_only_enabled():
+        return rt.forward_ar(
+            token_array,
+            cache=cache,
+            return_hidden=False,
+            emit_logits=not _final_logits_prefill_enabled(),
+        )
+    _runtime_count(rt, "prefill_external_cache_only_calls")
+    if _prefill_stock_cache_only_enabled():
+        _runtime_count(rt, "prefill_stock_cache_only_calls")
+    if _prefill_omlx_external_enabled():
+        _runtime_count(rt, "prefill_omlx_external_calls")
+    if not _prefill_external_emit_logits_enabled():
+        return rt.forward_ar(
+            token_array,
+            cache=cache,
+            return_hidden=False,
+            emit_logits=False,
+        )
+    unused_logits = rt.model(token_array, cache=cache)
+    del unused_logits
+    return None
+
+
+def _prefill_chunk_size() -> int:
+    raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE") or "2048").strip().lower()
+    if raw == "auto":
+        layout = _sustained_prefill_layout()
+        if layout == "contiguous_dense_decode":
+            return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
+        return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2048
+
+
+def _iter_prefill_chunks(token_ids: list[int]) -> list[list[int]]:
+    if not token_ids:
+        return []
+    if not _sustained_prefill_enabled():
+        return [token_ids]
+    chunk_size = _prefill_chunk_size()
+    return [token_ids[start : start + chunk_size] for start in range(0, len(token_ids), chunk_size)]
+
+
+def _iter_prefill_chunk_spans(token_count: int) -> list[tuple[int, int]]:
+    if token_count <= 0:
+        return []
+    if not _sustained_prefill_enabled():
+        return [(0, token_count)]
+    chunk_size = _prefill_chunk_size()
+    return [
+        (start, min(token_count, start + chunk_size))
+        for start in range(0, token_count, chunk_size)
+    ]
+
+
+def _sustained_prefill_layout() -> str:
+    layout = (
+        os.environ.get("MTPLX_SUSTAINED_PREFILL_LAYOUT", "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if layout != "auto":
+        return layout
+    context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+    dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
+    if context_tokens > 0 and context_tokens <= dense_max:
+        return "contiguous_dense_decode"
+    return "contiguous_then_repage"
+
+
+def _defer_verify_hidden_eval_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_DEFER_VERIFY_HIDDEN_EVAL") or "").strip().lower()
+    if raw == "auto":
+        context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+        dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
+        return context_tokens > 0 and context_tokens <= dense_max
+    return _env_truthy("MTPLX_DEFER_VERIFY_HIDDEN_EVAL")
+
+
+def _verify_hidden_mode() -> str:
+    raw = (
+        os.environ.get("MTPLX_VERIFY_HIDDEN_MODE") or "default"
+    ).strip().lower().replace("-", "_")
+    return raw or "default"
+
+
+def _clear_cache_every() -> int:
+    raw = (os.environ.get("MTPLX_CLEAR_CACHE_EVERY") or "auto").strip().lower()
+    if raw == "auto":
+        context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+        # Lowered default 98304 -> 16384 so clear_cache fires for the typical
+        # opencode subagent context regime (16-40K) where wired-memory pressure
+        # has been observed in practice. The previous threshold only kicked in
+        # past 96K, well above the crash zone.
+        threshold = _env_int("MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD", 16384)
+        if context_tokens >= threshold and _contiguous_dense_decode_prefill_enabled():
+            # Default 16 tokens was per-step aggressive (sync barrier every
+            # tick). Bumped to 256 to amortize the sync cost while still
+            # bounding allocator growth.
+            return max(0, _env_int("MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT", 256))
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _contiguous_then_repage_prefill_enabled() -> bool:
+    return _sustained_prefill_layout() == "contiguous_then_repage"
+
+
+def _contiguous_dense_decode_prefill_enabled() -> bool:
+    return _sustained_prefill_layout() == "contiguous_dense_decode"
+
+
+def _contiguous_prefill_cache_layout_enabled() -> bool:
+    return (
+        _contiguous_then_repage_prefill_enabled()
+        or _contiguous_dense_decode_prefill_enabled()
+    )
+
+
+@contextmanager
+def _target_prefill_cache_layout_scope():
+    if not _contiguous_prefill_cache_layout_enabled():
+        yield
+        return
+    keys = (
+        "MTPLX_VLLM_METAL_PAGED_ATTN",
+        "MTPLX_OWNED_ATTN_KV",
+        "MTPLX_BLOCK_OWNED_ATTN_KV",
+    )
+    saved = {key: os.environ.get(key) for key in keys}
+    os.environ["MTPLX_VLLM_METAL_PAGED_ATTN"] = "0"
+    os.environ["MTPLX_OWNED_ATTN_KV"] = "0"
+    os.environ["MTPLX_BLOCK_OWNED_ATTN_KV"] = "0"
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _make_target_prefill_cache(rt: MTPLXRuntime):
+    with _target_prefill_cache_layout_scope():
+        return rt.make_cache()
+
+
+def _maybe_repage_target_prefill_cache(cache: Any) -> float:
+    if not _contiguous_then_repage_prefill_enabled():
+        return 0.0
+    from .cache_state import configure_tail_owned_attention_kv_cache
+
+    started = time.perf_counter()
+    configure_tail_owned_attention_kv_cache(cache)
+    _eval_cache_roots(cache)
+    return time.perf_counter() - started
+
+
+def _eval_cache_roots(cache: Any) -> None:
+    arrays = _tree_mx_arrays(cache)
+    if not arrays:
+        return
+    deduped: list[mx.array] = []
+    seen: set[int] = set()
+    for array in arrays:
+        ident = id(array)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        deduped.append(array)
+    if deduped:
+        _eval(*deduped, _caller_depth=2)
+
+
+def _eval_verify_outputs(verify_logits: mx.array, verify_hidden: mx.array, captures: Any | None = None) -> dict[str, float]:
+    # Keep capture tensors lazy; commit_captured_prefix materializes only the selected prefix slice.
+    timings = {
+        "verify_logits_eval_time_s": 0.0,
+        "verify_hidden_eval_time_s": 0.0,
+        "verify_joint_eval_time_s": 0.0,
+    }
+    if os.environ.get("MTPLX_LAZY_VERIFY_LOGITS"):
+        started = time.perf_counter()
+        _eval(verify_hidden, _caller_depth=2)
+        timings["verify_hidden_eval_time_s"] += time.perf_counter() - started
+        return timings
+    if os.environ.get("MTPLX_SPLIT_VERIFY_EVAL"):
+        started = time.perf_counter()
+        _eval(verify_logits, _caller_depth=2)
+        timings["verify_logits_eval_time_s"] += time.perf_counter() - started
+        started = time.perf_counter()
+        _eval(verify_hidden, _caller_depth=2)
+        timings["verify_hidden_eval_time_s"] += time.perf_counter() - started
+        return timings
+    started = time.perf_counter()
+    _eval(verify_logits, verify_hidden, _caller_depth=2)
+    timings["verify_joint_eval_time_s"] += time.perf_counter() - started
+    return timings
+
+
+def _tree_nbytes(value: Any, seen: set[int] | None = None) -> int:
+    """Best-effort recursive byte count for MLX/NumPy array trees."""
+    if value is None:
+        return 0
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return 0
+    seen.add(value_id)
+    if isinstance(value, mx.array):
+        return int(value.nbytes)
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if isinstance(value, (str, bytes, bytearray, int, float, bool)):
+        return 0
+    if isinstance(value, dict):
+        return sum(_tree_nbytes(item, seen) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return sum(_tree_nbytes(item, seen) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return sum(_tree_nbytes(getattr(value, item.name), seen) for item in fields(value))
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        return sum(_tree_nbytes(item, seen) for item in attrs.values())
+    return 0
+
+
+def _tree_mx_arrays(value: Any, seen: set[int] | None = None) -> list[mx.array]:
+    if value is None:
+        return []
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return []
+    seen.add(value_id)
+    if isinstance(value, mx.array):
+        return [value]
+    if isinstance(value, np.ndarray):
+        return []
+    if isinstance(value, (str, bytes, bytearray, int, float, bool)):
+        return []
+    if isinstance(value, dict):
+        arrays: list[mx.array] = []
+        for item in value.values():
+            arrays.extend(_tree_mx_arrays(item, seen))
+        return arrays
+    if isinstance(value, (list, tuple, set)):
+        arrays = []
+        for item in value:
+            arrays.extend(_tree_mx_arrays(item, seen))
+        return arrays
+    if is_dataclass(value) and not isinstance(value, type):
+        arrays = []
+        for item in fields(value):
+            arrays.extend(_tree_mx_arrays(getattr(value, item.name), seen))
+        return arrays
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        arrays = []
+        for item in attrs.values():
+            arrays.extend(_tree_mx_arrays(item, seen))
+        return arrays
+    return []
+
+
+def _mlx_memory_stats() -> dict[str, int]:
+    return {
+        "active_memory_bytes": int(mx.get_active_memory()),
+        "peak_memory_bytes": int(mx.get_peak_memory()),
+        "cache_memory_bytes": int(mx.get_cache_memory()),
+    }
+
+
+class _DecodeTrace:
+    def __init__(
+        self,
+        *,
+        prompt_tokens: int,
+        max_tokens: int,
+        speculative_depth: int,
+        sampler: SamplerConfig,
+        verify_strategy: str,
+        verify_core: str,
+        mtp_history_policy: str,
+        mtp_cache_policy: str,
+        trace_label: str | None,
+        trace_metadata: dict[str, Any] | None,
+    ) -> None:
+        trace_path = os.environ.get("MTPLX_DECODE_TRACE_JSONL")
+        self.enabled = bool(trace_path)
+        self.path = Path(trace_path).expanduser() if trace_path else None
+        self.interval_s = max(
+            0.1,
+            float(os.environ.get("MTPLX_DECODE_TRACE_INTERVAL_S") or 1.0),
+        )
+        self.run_id = f"{int(time.time() * 1000)}-{os.getpid()}-{id(self):x}"
+        self.label = trace_label or os.environ.get("MTPLX_DECODE_TRACE_LABEL") or None
+        self.metadata = dict(trace_metadata or {})
+        self.prompt_tokens = int(prompt_tokens)
+        self.max_tokens = int(max_tokens)
+        self.speculative_depth = int(speculative_depth)
+        self.sampler = sampler
+        self.verify_strategy = verify_strategy
+        self.verify_core = verify_core
+        self.mtp_history_policy = mtp_history_policy
+        self.mtp_cache_policy = mtp_cache_policy
+        self.started_s = time.perf_counter()
+        self.last_emit_s = self.started_s
+        self.bucket_index = 0
+        self.last_totals: dict[str, Any] = {
+            "generated_tokens": 0,
+            "accepted_drafts": 0,
+            "rejected_drafts": 0,
+            "drafted_tokens": 0,
+            "verify_calls": 0,
+            "correction_tokens": 0,
+            "bonus_tokens": 0,
+            "verify_time_s": 0.0,
+            "verify_forward_time_s": 0.0,
+            "verify_eval_time_s": 0.0,
+            "verify_logits_eval_time_s": 0.0,
+            "verify_hidden_eval_time_s": 0.0,
+            "verify_joint_eval_time_s": 0.0,
+            "verify_target_distribution_time_s": 0.0,
+            "verify_eval_unattributed_time_s": 0.0,
+            "draft_time_s": 0.0,
+            "accept_time_s": 0.0,
+            "repair_time_s": 0.0,
+            "commit_time_s": 0.0,
+            "capture_commit_time_s": 0.0,
+            "snapshot_time_s": 0.0,
+            "bonus_time_s": 0.0,
+            "verify_output_nbytes": 0,
+            "draft_output_nbytes": 0,
+            "mtp_history_append_nbytes": 0,
+            "clear_cache_events": 0,
+            "clear_cache_time_s": 0.0,
+            "trunk_cache_materialize_events": 0,
+            "trunk_cache_materialize_time_s": 0.0,
+            "dirty_detach_events": 0,
+            "dirty_detach_time_s": 0.0,
+            "dirty_detach_arrays": 0,
+            "dirty_detach_bytes": 0,
+            "live_output_detach_events": 0,
+            "live_output_detach_time_s": 0.0,
+            "live_output_detach_arrays": 0,
+            "live_output_detach_bytes": 0,
+            "state_rebase_events": 0,
+            "state_rebase_time_s": 0.0,
+            "state_root_eval_events": 0,
+            "state_root_eval_time_s": 0.0,
+            "state_root_eval_arrays": 0,
+            "trace_accounting_time_s": 0.0,
+            "accepted_by_depth": [0 for _ in range(speculative_depth)],
+            "drafted_by_depth": [0 for _ in range(speculative_depth)],
+            "accept_probability_sum_by_depth": [0.0 for _ in range(speculative_depth)],
+        }
+        if self.enabled and self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _delta(self, totals: dict[str, Any], key: str) -> Any:
+        value = totals[key]
+        previous = self.last_totals[key]
+        if isinstance(value, list):
+            return [
+                (float(item) - float(prev))
+                for item, prev in zip(value, previous)
+            ]
+        return value - previous
+
+    def maybe_emit(
+        self,
+        *,
+        force: bool,
+        final: bool,
+        totals: dict[str, Any],
+        cache: Any,
+        mtp_cache: Any,
+        mtp_history_materialize_every: int,
+        mtp_history_materialize_events: int,
+    ) -> None:
+        if not self.enabled or self.path is None:
+            return
+        now = time.perf_counter()
+        if not force and now - self.last_emit_s < self.interval_s:
+            return
+        elapsed_s = max(0.0, now - self.last_emit_s)
+        generated_delta = int(self._delta(totals, "generated_tokens"))
+        drafted_by_depth_delta = [
+            int(item) for item in self._delta(totals, "drafted_by_depth")
+        ]
+        accepted_by_depth_delta = [
+            int(item) for item in self._delta(totals, "accepted_by_depth")
+        ]
+        accept_probability_sum_delta = [
+            float(item)
+            for item in self._delta(totals, "accept_probability_sum_by_depth")
+        ]
+        acceptance_rate_by_depth_delta = [
+            (
+                float(accepted) / int(drafted)
+                if drafted
+                else None
+            )
+            for accepted, drafted in zip(accepted_by_depth_delta, drafted_by_depth_delta)
+        ]
+        mean_accept_probability_by_depth_delta = [
+            (
+                float(total) / int(drafted)
+                if drafted
+                else None
+            )
+            for total, drafted in zip(accept_probability_sum_delta, drafted_by_depth_delta)
+        ]
+        verify_calls_delta = int(self._delta(totals, "verify_calls"))
+        accepted_drafts_delta = int(self._delta(totals, "accepted_drafts"))
+        drafted_tokens_delta = int(self._delta(totals, "drafted_tokens"))
+        verify_time_delta = float(self._delta(totals, "verify_time_s"))
+        verify_forward_time_delta = float(self._delta(totals, "verify_forward_time_s"))
+        verify_eval_time_delta = float(self._delta(totals, "verify_eval_time_s"))
+        verify_logits_eval_time_delta = float(self._delta(totals, "verify_logits_eval_time_s"))
+        verify_hidden_eval_time_delta = float(self._delta(totals, "verify_hidden_eval_time_s"))
+        verify_joint_eval_time_delta = float(self._delta(totals, "verify_joint_eval_time_s"))
+        verify_target_distribution_time_delta = float(
+            self._delta(totals, "verify_target_distribution_time_s")
+        )
+        verify_eval_unattributed_time_delta = float(
+            self._delta(totals, "verify_eval_unattributed_time_s")
+        )
+        draft_time_delta = float(self._delta(totals, "draft_time_s"))
+        clear_cache_events_delta = int(self._delta(totals, "clear_cache_events"))
+        clear_cache_time_delta = float(self._delta(totals, "clear_cache_time_s"))
+        trunk_cache_materialize_events_delta = int(
+            self._delta(totals, "trunk_cache_materialize_events")
+        )
+        trunk_cache_materialize_time_delta = float(
+            self._delta(totals, "trunk_cache_materialize_time_s")
+        )
+        dirty_detach_events_delta = int(self._delta(totals, "dirty_detach_events"))
+        dirty_detach_time_delta = float(self._delta(totals, "dirty_detach_time_s"))
+        dirty_detach_arrays_delta = int(self._delta(totals, "dirty_detach_arrays"))
+        dirty_detach_bytes_delta = int(self._delta(totals, "dirty_detach_bytes"))
+        live_output_detach_events_delta = int(self._delta(totals, "live_output_detach_events"))
+        live_output_detach_time_delta = float(self._delta(totals, "live_output_detach_time_s"))
+        live_output_detach_arrays_delta = int(self._delta(totals, "live_output_detach_arrays"))
+        live_output_detach_bytes_delta = int(self._delta(totals, "live_output_detach_bytes"))
+        state_rebase_events_delta = int(self._delta(totals, "state_rebase_events"))
+        state_rebase_time_delta = float(self._delta(totals, "state_rebase_time_s"))
+        state_root_eval_events_delta = int(
+            self._delta(totals, "state_root_eval_events")
+        )
+        state_root_eval_time_delta = float(
+            self._delta(totals, "state_root_eval_time_s")
+        )
+        state_root_eval_arrays_delta = int(
+            self._delta(totals, "state_root_eval_arrays")
+        )
+        trace_accounting_time_delta = float(self._delta(totals, "trace_accounting_time_s"))
+        bytes_delta = {
+            "verify_output_nbytes_delta": int(self._delta(totals, "verify_output_nbytes")),
+            "draft_output_nbytes_delta": int(self._delta(totals, "draft_output_nbytes")),
+            "mtp_history_append_nbytes_delta": int(self._delta(totals, "mtp_history_append_nbytes")),
+        }
+        materialized_nbytes = sum(bytes_delta.values())
+        row = {
+            "event": "decode_trace_bucket",
+            "run_id": self.run_id,
+            "label": self.label,
+            "bucket_index": self.bucket_index,
+            "final": bool(final),
+            "t_start_s": self.last_emit_s - self.started_s,
+            "t_end_s": now - self.started_s,
+            "elapsed_s": elapsed_s,
+            "prompt_tokens": self.prompt_tokens,
+            "max_tokens": self.max_tokens,
+            "generated_tokens_total": int(totals["generated_tokens"]),
+            "generated_tokens_delta": generated_delta,
+            "tok_s_delta": generated_delta / elapsed_s if elapsed_s > 0 else None,
+            "context_len": self.prompt_tokens + int(totals["generated_tokens"]),
+            "speculative_depth": self.speculative_depth,
+            "verify_calls_total": int(totals["verify_calls"]),
+            "verify_calls_delta": verify_calls_delta,
+            "accepted_drafts_total": int(totals["accepted_drafts"]),
+            "accepted_drafts_delta": accepted_drafts_delta,
+            "drafted_tokens_total": int(totals["drafted_tokens"]),
+            "drafted_tokens_delta": drafted_tokens_delta,
+            "accepted_per_verify_delta": (
+                accepted_drafts_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "draft_acceptance_rate_delta": (
+                accepted_drafts_delta / drafted_tokens_delta
+                if drafted_tokens_delta
+                else None
+            ),
+            "accepted_by_depth_total": [int(item) for item in totals["accepted_by_depth"]],
+            "accepted_by_depth_delta": accepted_by_depth_delta,
+            "drafted_by_depth_total": [int(item) for item in totals["drafted_by_depth"]],
+            "drafted_by_depth_delta": drafted_by_depth_delta,
+            "acceptance_rate_by_depth_delta": acceptance_rate_by_depth_delta,
+            "mean_accept_probability_by_depth_delta": mean_accept_probability_by_depth_delta,
+            "rejected_drafts_delta": int(self._delta(totals, "rejected_drafts")),
+            "correction_tokens_delta": int(self._delta(totals, "correction_tokens")),
+            "bonus_tokens_delta": int(self._delta(totals, "bonus_tokens")),
+            "verify_time_s_delta": verify_time_delta,
+            "verify_forward_time_s_delta": verify_forward_time_delta,
+            "verify_eval_time_s_delta": verify_eval_time_delta,
+            "verify_logits_eval_time_s_delta": verify_logits_eval_time_delta,
+            "verify_hidden_eval_time_s_delta": verify_hidden_eval_time_delta,
+            "verify_joint_eval_time_s_delta": verify_joint_eval_time_delta,
+            "verify_target_distribution_time_s_delta": verify_target_distribution_time_delta,
+            "verify_eval_unattributed_time_s_delta": verify_eval_unattributed_time_delta,
+            "draft_time_s_delta": draft_time_delta,
+            "accept_time_s_delta": float(self._delta(totals, "accept_time_s")),
+            "repair_time_s_delta": float(self._delta(totals, "repair_time_s")),
+            "commit_time_s_delta": float(self._delta(totals, "commit_time_s")),
+            "capture_commit_time_s_delta": float(self._delta(totals, "capture_commit_time_s")),
+            "snapshot_time_s_delta": float(self._delta(totals, "snapshot_time_s")),
+            "bonus_time_s_delta": float(self._delta(totals, "bonus_time_s")),
+            "verify_ms_per_call_delta": (
+                1000.0 * verify_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "verify_forward_ms_per_call_delta": (
+                1000.0 * verify_forward_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "verify_eval_ms_per_call_delta": (
+                1000.0 * verify_eval_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "verify_logits_eval_ms_per_call_delta": (
+                1000.0 * verify_logits_eval_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "verify_hidden_eval_ms_per_call_delta": (
+                1000.0 * verify_hidden_eval_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "verify_joint_eval_ms_per_call_delta": (
+                1000.0 * verify_joint_eval_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "verify_target_distribution_ms_per_call_delta": (
+                1000.0 * verify_target_distribution_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "verify_eval_unattributed_ms_per_call_delta": (
+                1000.0 * verify_eval_unattributed_time_delta / verify_calls_delta
+                if verify_calls_delta
+                else None
+            ),
+            "draft_ms_per_token_delta": (
+                1000.0 * draft_time_delta / drafted_tokens_delta
+                if drafted_tokens_delta
+                else None
+            ),
+            **bytes_delta,
+            "estimated_materialized_nbytes_delta": materialized_nbytes,
+            "estimated_materialized_gib_s": (
+                (materialized_nbytes / (1024**3)) / elapsed_s
+                if elapsed_s > 0
+                else None
+            ),
+            "cache_state_nbytes": _tree_nbytes(cache),
+            "mtp_cache_state_nbytes": _tree_nbytes(mtp_cache),
+            "mlx_memory": _mlx_memory_stats(),
+            "lazy_verify_logits": bool(os.environ.get("MTPLX_LAZY_VERIFY_LOGITS")),
+            "defer_verify_hidden_eval": _defer_verify_hidden_eval_enabled(),
+            "verify_hidden_mode": _verify_hidden_mode(),
+            "split_verify_eval": bool(os.environ.get("MTPLX_SPLIT_VERIFY_EVAL")),
+            "lazy_mtp_history_append": bool(os.environ.get("MTPLX_LAZY_MTP_HISTORY_APPEND")),
+            "batch_target_arrays": bool(os.environ.get("MTPLX_BATCH_TARGET_ARRAYS")),
+            "drop_events": bool(os.environ.get("MTPLX_DROP_EVENTS")),
+            "skip_verify_snapshot": bool(os.environ.get("MTPLX_SKIP_VERIFY_SNAPSHOT")),
+            "mtp_history_materialize_every": int(mtp_history_materialize_every),
+            "mtp_history_materialize_events": int(mtp_history_materialize_events),
+            "clear_cache_every": int(_clear_cache_every()),
+            "clear_cache_events_total": int(totals["clear_cache_events"]),
+            "clear_cache_events_delta": clear_cache_events_delta,
+            "clear_cache_time_s_total": float(totals["clear_cache_time_s"]),
+            "clear_cache_time_s_delta": clear_cache_time_delta,
+            "trunk_cache_materialize_every": int(
+                os.environ.get("MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY") or 0
+            ),
+            "trunk_cache_materialize_events_total": int(
+                totals["trunk_cache_materialize_events"]
+            ),
+            "trunk_cache_materialize_events_delta": trunk_cache_materialize_events_delta,
+            "trunk_cache_materialize_time_s_total": float(
+                totals["trunk_cache_materialize_time_s"]
+            ),
+            "trunk_cache_materialize_time_s_delta": trunk_cache_materialize_time_delta,
+            "dirty_detach_components": os.environ.get("MTPLX_DETACH_COMPONENTS"),
+            "dirty_detach_mode": os.environ.get("MTPLX_DETACH_MODE"),
+            "dirty_detach_gdn_every": int(os.environ.get("MTPLX_DETACH_GDN_EVERY") or 0),
+            "dirty_detach_conv_every": int(os.environ.get("MTPLX_DETACH_CONV_EVERY") or 0),
+            "dirty_detach_attn_every": int(os.environ.get("MTPLX_DETACH_ATTN_EVERY") or 0),
+            "dirty_detach_events_total": int(totals["dirty_detach_events"]),
+            "dirty_detach_events_delta": dirty_detach_events_delta,
+            "dirty_detach_time_s_total": float(totals["dirty_detach_time_s"]),
+            "dirty_detach_time_s_delta": dirty_detach_time_delta,
+            "dirty_detach_arrays_total": int(totals["dirty_detach_arrays"]),
+            "dirty_detach_arrays_delta": dirty_detach_arrays_delta,
+            "dirty_detach_bytes_total": int(totals["dirty_detach_bytes"]),
+            "dirty_detach_bytes_delta": dirty_detach_bytes_delta,
+            "live_output_detach_enabled": bool(os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS")),
+            "live_output_detach_mode": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE"),
+            "live_output_detach_events_total": int(totals["live_output_detach_events"]),
+            "live_output_detach_events_delta": live_output_detach_events_delta,
+            "live_output_detach_time_s_total": float(totals["live_output_detach_time_s"]),
+            "live_output_detach_time_s_delta": live_output_detach_time_delta,
+            "live_output_detach_arrays_total": int(totals["live_output_detach_arrays"]),
+            "live_output_detach_arrays_delta": live_output_detach_arrays_delta,
+            "live_output_detach_bytes_total": int(totals["live_output_detach_bytes"]),
+            "live_output_detach_bytes_delta": live_output_detach_bytes_delta,
+            "state_rebase_every": int(os.environ.get("MTPLX_STATE_REBASE_EVERY") or 0),
+            "state_rebase_events_total": int(totals["state_rebase_events"]),
+            "state_rebase_events_delta": state_rebase_events_delta,
+            "state_rebase_time_s_total": float(totals["state_rebase_time_s"]),
+            "state_rebase_time_s_delta": state_rebase_time_delta,
+            "state_root_eval_enabled": bool(
+                os.environ.get("MTPLX_EVAL_STATE_ROOTS_ON_COMMIT")
+            ),
+            "state_root_eval_include_mtp": bool(
+                os.environ.get("MTPLX_EVAL_STATE_ROOTS_INCLUDE_MTP", "1")
+                .strip()
+                .lower()
+                not in {"0", "false", "no", "off"}
+            ),
+            "state_root_eval_events_total": int(totals["state_root_eval_events"]),
+            "state_root_eval_events_delta": state_root_eval_events_delta,
+            "state_root_eval_time_s_total": float(totals["state_root_eval_time_s"]),
+            "state_root_eval_time_s_delta": state_root_eval_time_delta,
+            "state_root_eval_arrays_total": int(totals["state_root_eval_arrays"]),
+            "state_root_eval_arrays_delta": state_root_eval_arrays_delta,
+            "trace_accounting_time_s_total": float(totals["trace_accounting_time_s"]),
+            "trace_accounting_time_s_delta": trace_accounting_time_delta,
+            "verify_strategy": self.verify_strategy,
+            "verify_core": self.verify_core,
+            "mtp_history_policy": self.mtp_history_policy,
+            "mtp_cache_policy": self.mtp_cache_policy,
+            "sampler": {
+                "temperature": float(self.sampler.temperature),
+                "top_p": float(self.sampler.top_p),
+                "top_k": int(self.sampler.top_k) if self.sampler.top_k is not None else None,
+            },
+            "metadata": self.metadata,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+        self.bucket_index += 1
+        self.last_emit_s = now
+        self.last_totals = {
+            key: (list(value) if isinstance(value, list) else value)
+            for key, value in totals.items()
+        }
+
+
+def _batch_target_distributions_enabled() -> bool:
+    return os.environ.get("MTPLX_BATCH_TARGET_DISTS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _batch_target_arrays_enabled() -> bool:
+    return os.environ.get("MTPLX_BATCH_TARGET_ARRAYS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@dataclass
+class GenerationStats:
+    mode: Mode
+    generated_tokens: int
+    elapsed_s: float
+    tok_s: float
+    benchmark_mode: str | None = None
+    load_mtp: bool | None = None
+    runtime_mtp_enabled: bool = False
+    draft_head_installed: bool | None = None
+    ar_return_hidden: bool = False
+    forward_ar_hidden_calls: int = 0
+    forward_ar_plain_calls: int = 0
+    mtp_forward_calls: int = 0
+    make_mtp_cache_calls: int = 0
+    update_mtp_cache_calls: int = 0
+    mtp_history_append_calls: int = 0
+    full_logits_tokens_emitted: int = 0
+    final_logits_tokens_emitted: int = 0
+    logits_tokens_emitted: int = 0
+    prefill_chunk_size: int = 0
+    prefill_chunks: int = 0
+    prefill_chunk_cache_cleanup_enabled: bool = False
+    prefill_chunk_cache_cleanup_every: int = 1
+    prefill_chunk_cache_cleanup_events: int = 0
+    prefill_stock_cache_only_enabled: bool = False
+    prefill_stock_cache_only_calls: int = 0
+    prefill_omlx_external_enabled: bool = False
+    prefill_omlx_external_calls: int = 0
+    prefill_external_emit_logits_enabled: bool = True
+    prefill_external_cache_only_calls: int = 0
+    paged_kv_capacity_tokens: int = 0
+    paged_kv_num_blocks: int = 0
+    paged_active_array_calls: int = 0
+    attention_dense_fallback_calls: int = 0
+    prefill_dense_fallback_calls: int = 0
+    decode_dense_fallback_calls: int = 0
+    ar_dense_fallback_calls: int = 0
+    postcommit_dense_fallback_calls: int = 0
+    paged_attention_bailouts_by_phase_reason: dict[str, int] = field(default_factory=dict)
+    paged_attention_large_q_path: str = ""
+    prefill_route: str = ""
+    large_q_split_sdpa_fallback_calls: int = 0
+    large_q_split_sdpa_fallback_calls_by_phase: dict[str, int] = field(
+        default_factory=dict
+    )
+    prefill_large_q_split_sdpa_fallback_calls: int = 0
+    decode_large_q_split_sdpa_fallback_calls: int = 0
+    partitioned_paged_calls: int = 0
+    partitioned_paged_calls_by_phase: dict[str, int] = field(default_factory=dict)
+    prefill_partitioned_paged_calls: int = 0
+    decode_partitioned_paged_calls: int = 0
+    sessionbank_snapshot_bytes: int = 0
+    sessionbank_skipped_oversized_snapshot: bool = False
+    session_prompt_prefix_bank_commit: dict[str, object] = field(default_factory=dict)
+    accepted_drafts: int = 0
+    rejected_drafts: int = 0
+    drafted_tokens: int = 0
+    verify_time_s: float = 0.0
+    verify_forward_time_s: float = 0.0
+    verify_eval_time_s: float = 0.0
+    verify_logits_eval_time_s: float = 0.0
+    verify_hidden_eval_time_s: float = 0.0
+    verify_joint_eval_time_s: float = 0.0
+    verify_target_distribution_time_s: float = 0.0
+    verify_eval_unattributed_time_s: float = 0.0
+    verify_hidden_mode: str = "default"
+    draft_time_s: float = 0.0
+    target_forward_time_s: float = 0.0
+    prompt_eval_time_s: float = 0.0
+    prompt_tps: float = 0.0
+    prompt_target_prefill_time_s: float = 0.0
+    prompt_mtp_history_time_s: float = 0.0
+    prompt_target_prefill_tok_s: float = 0.0
+    prompt_mtp_history_tok_s: float = 0.0
+    mtp_history_policy: str = "cycle"
+    mtp_history_window_tokens: int = 0
+    mtp_history_position_base: int = 0
+    cached_tokens: int = 0
+    new_prefill_tokens: int = 0
+    session_cache_hit: bool = False
+    cache_miss_reason: str | None = None
+    session_restore_mode: str = "cold"
+    snapshot_time_s: float = 0.0
+    accept_time_s: float = 0.0
+    rollback_time_s: float = 0.0
+    repair_time_s: float = 0.0
+    commit_time_s: float = 0.0
+    capture_commit_time_s: float = 0.0
+    mtp_history_materialize_every: int = 0
+    mtp_history_materialize_events: int = 0
+    clear_cache_every: int = 0
+    clear_cache_events: int = 0
+    clear_cache_time_s: float = 0.0
+    trunk_cache_materialize_every: int = 0
+    trunk_cache_materialize_events: int = 0
+    trunk_cache_materialize_time_s: float = 0.0
+    dirty_detach_components: list[str] = field(default_factory=list)
+    dirty_detach_mode: str = "selected_slice_contiguous_eval"
+    dirty_detach_gdn_every: int = 0
+    dirty_detach_conv_every: int = 0
+    dirty_detach_attn_every: int = 0
+    dirty_detach_events: int = 0
+    dirty_detach_time_s: float = 0.0
+    dirty_detach_arrays: int = 0
+    dirty_detach_bytes: int = 0
+    live_output_detach_enabled: bool = False
+    live_output_detach_mode: str = "contiguous_eval"
+    live_output_detach_events: int = 0
+    live_output_detach_time_s: float = 0.0
+    live_output_detach_arrays: int = 0
+    live_output_detach_bytes: int = 0
+    state_rebase_every: int = 0
+    state_rebase_events: int = 0
+    state_rebase_time_s: float = 0.0
+    state_root_eval_enabled: bool = False
+    state_root_eval_include_mtp: bool = True
+    state_root_eval_events: int = 0
+    state_root_eval_time_s: float = 0.0
+    state_root_eval_arrays: int = 0
+    capture_commit_detach_components: list[str] = field(default_factory=list)
+    capture_commit_detach_mode: str = "selected_slice_contiguous_eval"
+    capture_commit_detach_gdn_every: int = 0
+    capture_commit_detach_conv_every: int = 0
+    capture_commit_detach_events: int = 0
+    capture_commit_detach_time_s: float = 0.0
+    capture_commit_detach_arrays: int = 0
+    capture_commit_detach_bytes: int = 0
+    trace_accounting_time_s: float = 0.0
+    decode_trace_path: str | None = None
+    decode_trace_run_id: str | None = None
+    bonus_time_s: float = 0.0
+    online_hidden_corrector_time_s: float = 0.0
+    peak_memory_bytes: int = 0
+    speculative_depth: int = 0
+    requested_speculative_depth: int = 0
+    long_context_mtp_depth_policy: dict[str, object] = field(default_factory=dict)
+    accepted_by_depth: list[int] = field(default_factory=list)
+    drafted_by_depth: list[int] = field(default_factory=list)
+    accept_probability_sum_by_depth: list[float] = field(default_factory=list)
+    mean_accept_probability_by_depth: list[float | None] = field(default_factory=list)
+    skipped_drafts: int = 0
+    bonus_tokens: int = 0
+    correction_tokens: int = 0
+    verify_calls: int = 0
+    graphbank: dict[str, object] = field(default_factory=dict)
+    reject_path_counts: dict[str, int] = field(default_factory=dict)
+    repair_time_by_reject_depth_s: dict[str, float] = field(default_factory=dict)
+    deferred_correction_repairs: int = 0
+    online_correction_cache: dict[str, object] = field(default_factory=dict)
+    adapter_ensemble_q: dict[str, object] = field(default_factory=dict)
+    mtp_topk_reranker: dict[str, object] = field(default_factory=dict)
+    draft_core: dict[str, object] = field(default_factory=dict)
+    owned_recurrent_state: dict[str, object] = field(default_factory=dict)
+    owned_attn_kv: dict[str, object] = field(default_factory=dict)
+    events: list[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class GenerationOutput:
+    tokens: list[int]
+    text: str
+    stats: GenerationStats
+    final_state: GenerationFinalState | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "tokens": self.tokens,
+            "text": self.text,
+            "stats": self.stats.to_dict(),
+        }
+
+
+@dataclass
+class PromptState:
+    trunk_cache: list[Any]
+    logits: Any
+    hidden: Any | None
+    committed_mtp_cache: Any | None
+    token_prefix: tuple[int, ...]
+    prompt_eval_time_s: float
+    prompt_mtp_history_time_s: float = 0.0
+    mtp_history_policy: str = "cycle"
+    mtp_history_window_tokens: int = 0
+    mtp_history_position_base: int = 0
+    cached_tokens: int = 0
+    suffix_tokens: int = 0
+    cache_hit: bool = False
+    cache_miss_reason: str | None = None
+    restore_mode: str = "cold"
+
+
+class PostcommitAbort(RuntimeError):
+    """Raised when best-effort postcommit prefill yields to foreground work."""
+
+
+def _check_postcommit_abort(abort_check: Callable[[], bool] | None) -> None:
+    if abort_check is not None and bool(abort_check()):
+        raise PostcommitAbort("foreground_preempted_postcommit")
+
+
+@dataclass
+class GenerationFinalState:
+    final_trunk_cache: list[Any]
+    final_logits: Any
+    final_hidden: Any | None
+    final_committed_mtp_cache: Any | None
+    generated_token_ids: tuple[int, ...]
+    safe_to_commit: bool
+    finish_reason: str
+    mtp_history_policy: str = "cycle"
+    mtp_history_window_tokens: int = 0
+    mtp_history_position_base: int = 0
+
+
+def _prefill_restored_prompt_suffix(
+    rt: MTPLXRuntime,
+    restored: Any,
+    suffix: list[int],
+    *,
+    mtp_hidden_variant: str,
+    mtp_history_policy: str,
+    abort_check: Callable[[], bool] | None = None,
+) -> tuple[Any, Any, float, float]:
+    """Extend a restored SessionBank prefix without one giant suffix forward.
+
+    The old warm-prefix path sent the entire suffix through `forward_ar` with
+    hidden capture and logits enabled. In OpenCode sessions that made a stale
+    postcommit suffix behave like a full long-context prefill and, worse, it
+    could not observe abort requests until the huge Metal graph completed. This
+    mirrors the oMLX-style prefill shape: cache-only or hidden-only chunks for
+    the body, then a single final-token logits/hidden pass for decode startup.
+    """
+
+    if not suffix:
+        raise ValueError("suffix must not be empty")
+    _check_postcommit_abort(abort_check)
+    target_forward_time = 0.0
+    mtp_history_time = 0.0
+    final_logits_only = _final_logits_prefill_enabled()
+    use_committed_mtp = (
+        _mtp_history_uses_committed_cache(mtp_history_policy)
+        and restored.mtp_history_cache is not None
+    )
+
+    def append_history(hidden_states: Any, token_ids: list[int]) -> None:
+        nonlocal mtp_history_time
+        if not use_committed_mtp or not token_ids:
+            return
+        mtp_history_time += _append_mtp_history(
+            rt,
+            restored.mtp_history_cache,
+            hidden_states,
+            token_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            force_eval=True,
+        )
+        _check_postcommit_abort(abort_check)
+
+    if use_committed_mtp and restored.hidden is not None:
+        append_history(restored.hidden, [int(suffix[0])])
+
+    if len(suffix) > 1:
+        body = suffix[:-1]
+        body_array = mx.array([body])
+        for start, end in _iter_prefill_chunk_spans(len(body)):
+            _check_postcommit_abort(abort_check)
+            chunk_array = body_array[:, start:end]
+            started = time.perf_counter()
+            with attention_phase("prefill"):
+                if use_committed_mtp:
+                    logits_chunk, hidden_chunk = rt.forward_ar(
+                        chunk_array,
+                        cache=restored.cache,
+                        return_hidden=True,
+                        hidden_variant=mtp_hidden_variant,
+                        emit_logits=False,
+                    )
+                else:
+                    hidden_chunk = None
+                    logits_chunk = _prefill_cache_only_forward(
+                        rt,
+                        chunk_array,
+                        restored.cache,
+                    )
+            if hidden_chunk is None:
+                if logits_chunk is None:
+                    _eval_cache_roots(restored.cache)
+                else:
+                    _eval(logits_chunk)
+            elif logits_chunk is None:
+                _eval(hidden_chunk)
+            else:
+                _eval(logits_chunk, hidden_chunk)
+            target_forward_time += time.perf_counter() - started
+            _runtime_count(rt, "restored_suffix_prefill_chunks")
+            _runtime_count(rt, "prefill_chunks")
+            _check_postcommit_abort(abort_check)
+
+            if hidden_chunk is not None:
+                append_history(
+                    hidden_chunk,
+                    [int(token) for token in suffix[start + 1 : end + 1]],
+                )
+            del hidden_chunk
+            del logits_chunk
+            target_forward_time += _prefill_chunk_cache_cleanup(rt)
+            _check_postcommit_abort(abort_check)
+
+    started = time.perf_counter()
+    _check_postcommit_abort(abort_check)
+    with attention_phase("prefill"):
+        suffix_logits, suffix_hidden = rt.forward_ar(
+            mx.array([[suffix[-1]]]),
+            cache=restored.cache,
+            return_hidden=True,
+            hidden_variant=mtp_hidden_variant,
+            emit_logits=True,
+            logits_keep=1 if final_logits_only else None,
+        )
+    _eval(suffix_logits, suffix_hidden)
+    target_forward_time += time.perf_counter() - started
+    _check_postcommit_abort(abort_check)
+    return (
+        suffix_logits[:, -1, :],
+        suffix_hidden[:, -1:, :],
+        target_forward_time,
+        mtp_history_time,
+    )
+
+
+def _cache_offset(cache: Any) -> int:
+    if not cache:
+        return 0
+    try:
+        return int(getattr(cache[0], "offset", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _trim_cache_to_offset(cache: Any, offset: int) -> bool:
+    target = max(0, int(offset))
+    if not cache:
+        return target == 0
+    for entry in cache:
+        current = int(getattr(entry, "offset", target) or 0)
+        if current < target:
+            return False
+        delta = current - target
+        if delta <= 0:
+            continue
+        trim = getattr(entry, "trim", None)
+        if not callable(trim):
+            return False
+        trimmed = int(trim(delta))
+        if trimmed != delta:
+            return False
+    return True
+
+
+def _entry_matches_restore_lookup(
+    entry: Any,
+    rt: MTPLXRuntime,
+    *,
+    hidden_variant: str | None,
+    template_hash: str | None,
+    mtp_history_policy: str | None,
+    draft_head_identity: str | None,
+    policy_fingerprint: str | None,
+) -> bool:
+    if getattr(entry, "model_path", None) != str(rt.model_path):
+        return False
+    if hidden_variant is not None and getattr(entry, "hidden_variant", None) != hidden_variant:
+        return False
+    if template_hash is not None and getattr(entry, "template_hash", None) != template_hash:
+        return False
+    entry_policy = getattr(entry, "mtp_history_policy", None)
+    if mtp_history_policy is not None:
+        if entry_policy != mtp_history_policy:
+            committed = {"committed", "last_window"}
+            if entry_policy not in committed or mtp_history_policy not in committed:
+                return False
+    if draft_head_identity is not None and getattr(entry, "draft_head_identity", None) != draft_head_identity:
+        return False
+    if policy_fingerprint is not None and getattr(entry, "policy_fingerprint", None) != policy_fingerprint:
+        return False
+    if (
+        getattr(entry, "mtp_snapshot_epoch", None) is not None
+        and int(getattr(entry, "mtp_snapshot_epoch")) != int(getattr(entry, "snapshot_epoch", 0))
+    ):
+        return False
+    return True
+
+
+def _near_prefix_restore_enabled() -> bool:
+    return not _env_falsey("MTPLX_SESSION_NEAR_PREFIX_RESTORE")
+
+
+def _restore_near_prefix_prompt_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    mtp_hidden_variant: str,
+    mtp_history_policy: str,
+    session_bank: Any,
+    template_hash: str | None,
+    draft_head_identity: str | None,
+    policy_fingerprint: str | None,
+    abort_check: Callable[[], bool] | None = None,
+) -> PromptState | None:
+    if not _near_prefix_restore_enabled() or len(prompt_ids) < 2:
+        return None
+    candidates = getattr(session_bank, "near_prefix_candidates", None)
+    if not callable(candidates):
+        return None
+    max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
+    min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
+    for entry, matched in candidates(
+        prompt_ids,
+        max_token_gap=max_gap,
+        min_matched_tokens=min_match,
+    ):
+        _check_postcommit_abort(abort_check)
+        matched = int(matched)
+        if matched < 2 or matched >= int(getattr(entry, "prefix_len", 0) or 0):
+            continue
+        if not _entry_matches_restore_lookup(
+            entry,
+            rt,
+            hidden_variant=mtp_hidden_variant,
+            template_hash=template_hash,
+            mtp_history_policy=mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+        ):
+            continue
+        if entry.mtp_history_snapshot is None and _mtp_history_uses_committed_cache(
+            mtp_history_policy
+        ):
+            continue
+
+        cache = rt.make_cache()
+        restore_cache(cache, entry.cache_snapshot)
+        if not _trim_cache_to_offset(cache, matched - 1):
+            continue
+
+        mtp_history_cache = None
+        if entry.mtp_history_snapshot is not None:
+            mtp_history_cache = rt.make_mtp_cache()
+            restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
+            if not _trim_cache_to_offset(mtp_history_cache, matched - 1):
+                continue
+
+        started = time.perf_counter()
+        _check_postcommit_abort(abort_check)
+        with attention_phase("prefill"):
+            logits, hidden = rt.forward_ar(
+                mx.array([[int(prompt_ids[matched - 1])]]),
+                cache=cache,
+                return_hidden=True,
+                hidden_variant=mtp_hidden_variant,
+                emit_logits=True,
+                logits_keep=1 if _final_logits_prefill_enabled() else None,
+            )
+        _eval(logits, hidden)
+        repair_time = time.perf_counter() - started
+        _check_postcommit_abort(abort_check)
+        restored = SimpleNamespace(
+            entry=SimpleNamespace(prefix_len=matched),
+            cache=cache,
+            logits=logits[:, -1, :],
+            hidden=hidden[:, -1:, :],
+            mtp_history_cache=mtp_history_cache,
+            restore_mode="near_prefix_clone",
+        )
+        suffix = list(prompt_ids[matched:])
+        if not suffix:
+            entry.hits += 1
+            entry.last_access_s = time.time()
+            return PromptState(
+                trunk_cache=cache,
+                logits=logits[:, -1, :],
+                hidden=hidden[:, -1:, :],
+                committed_mtp_cache=mtp_history_cache,
+                token_prefix=tuple(int(token) for token in prompt_ids),
+                prompt_eval_time_s=repair_time,
+                mtp_history_policy=mtp_history_policy,
+                cached_tokens=matched,
+                suffix_tokens=0,
+                cache_hit=True,
+                restore_mode="near_prefix_clone",
+            )
+        suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
+            _prefill_restored_prompt_suffix(
+                rt,
+                restored,
+                suffix,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                abort_check=abort_check,
+            )
+        )
+        entry.hits += 1
+        entry.last_access_s = time.time()
+        return PromptState(
+            trunk_cache=cache,
+            logits=suffix_logits,
+            hidden=suffix_hidden,
+            committed_mtp_cache=mtp_history_cache,
+            token_prefix=tuple(int(token) for token in prompt_ids),
+            prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
+            prompt_mtp_history_time_s=mtp_history_time,
+            mtp_history_policy=mtp_history_policy,
+            cached_tokens=matched,
+            suffix_tokens=len(suffix),
+            cache_hit=True,
+            restore_mode="near_prefix_clone",
+        )
+    return None
+
+
+def restore_or_prefill_prompt_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    mtp_hidden_variant: str = "post_norm",
+    mtp_history_policy: str = "cycle",
+    session_bank: Any | None = None,
+    restore_mode: str = "clone",
+    template_hash: str | None = None,
+    draft_head_identity: str | None = None,
+    policy_fingerprint: str | None = None,
+    abort_check: Callable[[], bool] | None = None,
+) -> PromptState:
+    """Build the initial prompt state used by MTP-k decode.
+
+    This is the first mechanical split point for the serving engine. It keeps
+    today's cold path behavior intact while giving EngineSession a concrete
+    target for future warm SessionBank restores.
+    """
+    os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
+    mtp_history_policy = _resolve_mtp_history_policy(
+        mtp_history_policy,
+        len(prompt_ids),
+    )
+    mtp_history_window_tokens = (
+        _mtp_history_last_window_tokens()
+        if mtp_history_policy == "last_window"
+        else 0
+    )
+    _check_postcommit_abort(abort_check)
+    if session_bank is not None:
+        restored = session_bank.restore(
+            rt,
+            prompt_ids,
+            mode=restore_mode,
+            hidden_variant=mtp_hidden_variant,
+            template_hash=template_hash,
+            mtp_history_policy=mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+        )
+        if restored is not None and (
+            not _mtp_history_uses_committed_cache(mtp_history_policy)
+            or restored.mtp_history_cache is not None
+        ):
+            _check_postcommit_abort(abort_check)
+            suffix = list(prompt_ids[restored.entry.prefix_len :])
+            if not suffix:
+                return PromptState(
+                    trunk_cache=restored.cache,
+                    logits=restored.logits,
+                    hidden=restored.hidden,
+                    committed_mtp_cache=restored.mtp_history_cache,
+                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    prompt_eval_time_s=0.0,
+                    mtp_history_policy=mtp_history_policy,
+                    mtp_history_window_tokens=mtp_history_window_tokens,
+                    cached_tokens=restored.entry.prefix_len,
+                    suffix_tokens=0,
+                    cache_hit=True,
+                    restore_mode=restored.restore_mode,
+                )
+
+            _check_postcommit_abort(abort_check)
+            suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
+                _prefill_restored_prompt_suffix(
+                    rt,
+                    restored,
+                    suffix,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_history_policy=mtp_history_policy,
+                    abort_check=abort_check,
+                )
+            )
+            return PromptState(
+                trunk_cache=restored.cache,
+                logits=suffix_logits,
+                hidden=suffix_hidden,
+                committed_mtp_cache=restored.mtp_history_cache,
+                token_prefix=tuple(int(token) for token in prompt_ids),
+                prompt_eval_time_s=suffix_time + mtp_history_time,
+                prompt_mtp_history_time_s=mtp_history_time,
+                mtp_history_policy=mtp_history_policy,
+                mtp_history_window_tokens=mtp_history_window_tokens,
+                cached_tokens=restored.entry.prefix_len,
+                suffix_tokens=len(suffix),
+                cache_hit=True,
+                restore_mode=restored.restore_mode,
+            )
+
+        near_prompt_state = _restore_near_prefix_prompt_state(
+            rt,
+            prompt_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            session_bank=session_bank,
+            template_hash=template_hash,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+            abort_check=abort_check,
+        )
+        if near_prompt_state is not None:
+            return near_prompt_state
+
+    mtp_history_cache = None
+    prompt_history_time = 0.0
+    mtp_history_position_base = 0
+    if _mtp_history_uses_committed_cache(mtp_history_policy):
+        if _sustained_prefill_enabled():
+            (
+                cache,
+                logits,
+                hidden,
+                mtp_history_cache,
+                target_time,
+                prompt_history_time,
+                mtp_history_position_base,
+            ) = _prefill_committed_mtp_history_streaming(
+                rt,
+                prompt_ids,
+                mtp_hidden_variant=mtp_hidden_variant,
+                history_window_tokens=(
+                    mtp_history_window_tokens
+                    if mtp_history_policy == "last_window"
+                    else None
+                ),
+                abort_check=abort_check,
+            )
+            prompt_eval_time = target_time + prompt_history_time
+        else:
+            _assert_safe_long_context_prefill(len(prompt_ids))
+            _check_postcommit_abort(abort_check)
+            cache, logits, hidden, prompt_hidden, target_time = _prefill_with_hidden_sequence(
+                rt,
+                prompt_ids,
+            )
+            _check_postcommit_abort(abort_check)
+            prompt_eval_time = target_time
+            mtp_history_cache = rt.make_mtp_cache()
+            if len(prompt_ids) > 1:
+                history_token_ids = prompt_ids[1:]
+                history_hidden = prompt_hidden[:, :-1, :]
+                if mtp_history_policy == "last_window":
+                    keep = min(len(history_token_ids), mtp_history_window_tokens)
+                    dropped = len(history_token_ids) - keep
+                    mtp_history_position_base = max(0, dropped)
+                    history_token_ids = history_token_ids[-keep:]
+                    history_hidden = history_hidden[:, -keep:, :]
+                prompt_history_time = _append_mtp_history(
+                    rt,
+                    mtp_history_cache,
+                    history_hidden,
+                    history_token_ids,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    position_offset=(
+                        mtp_history_position_base
+                        if mtp_history_policy == "last_window"
+                        else None
+                    ),
+                )
+                prompt_eval_time += prompt_history_time
+    else:
+        cache, logits, hidden, target_time = _prefill(
+            rt,
+            prompt_ids,
+            return_hidden=True,
+            abort_check=abort_check,
+        )
+        prompt_eval_time = target_time
+    return PromptState(
+        trunk_cache=cache,
+        logits=logits,
+        hidden=hidden,
+        committed_mtp_cache=mtp_history_cache,
+        token_prefix=tuple(int(token) for token in prompt_ids),
+        prompt_eval_time_s=prompt_eval_time,
+        prompt_mtp_history_time_s=prompt_history_time,
+        mtp_history_policy=mtp_history_policy,
+        mtp_history_window_tokens=mtp_history_window_tokens,
+        mtp_history_position_base=mtp_history_position_base,
+        suffix_tokens=len(prompt_ids),
+        cache_miss_reason=getattr(session_bank, "last_miss_reason", None)
+        if session_bank is not None
+        else None,
+    )
+
+
+def _decode(tokenizer, tokens: list[int]) -> str:
+    return tokenizer.decode(tokens)
+
+
+def _default_stop_tokens(tokenizer) -> set[int]:
+    ids: set[int] = set()
+    for attr in ("eos_token_id", "pad_token_id"):
+        value = getattr(tokenizer, attr, None)
+        if isinstance(value, int):
+            ids.add(value)
+    value = getattr(tokenizer, "eos_token_ids", None)
+    if isinstance(value, (list, tuple, set)):
+        ids.update(int(x) for x in value if isinstance(x, int))
+    return ids
+
+
+def _is_stop(token: int, stop_token_ids: set[int]) -> bool:
+    return int(token) in stop_token_ids
+
+
+def _strip_terminal_stop(tokens: list[int], stop_token_ids: set[int]) -> list[int]:
+    stripped = list(tokens)
+    while stripped and _is_stop(stripped[-1], stop_token_ids):
+        stripped.pop()
+    return stripped
+
+
+def _truncate_after_first_stop(tokens: list[int], stop_token_ids: set[int]) -> list[int]:
+    for index, token in enumerate(tokens):
+        if _is_stop(token, stop_token_ids):
+            return list(tokens[: index + 1])
+    return list(tokens)
+
+
+def _logits_to_numpy(logits: mx.array) -> np.ndarray:
+    logits = logits.astype(mx.float32)
+    _eval(logits)
+    arr = np.asarray(logits, dtype=np.float32).astype(np.float64)
+    return arr.reshape(-1)
+
+
+def _distribution_from_mlx_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> np.ndarray | SparseDistribution:
+    sparse = sparse_distribution_from_mlx_logits(logits, config)
+    if sparse is not None:
+        return sparse
+    return dense_distribution_from_logits(_logits_to_numpy(logits), config)
+
+
+def _distributions_from_mlx_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> list[np.ndarray | SparseDistribution] | None:
+    sparse = sparse_distributions_from_mlx_logits(logits, config)
+    if sparse is not None:
+        return list(sparse)
+    return None
+
+
+def _batched_distributions_from_mlx_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> BatchedSparseDistributions | None:
+    return batched_sparse_distributions_from_mlx_logits(logits, config)
+
+
+def _sample_from_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+) -> tuple[int, np.ndarray | SparseDistribution | None]:
+    if config.temperature <= 0:
+        _eval(logits)
+        return int(mx.argmax(logits, axis=-1).item()), None
+    probs = _distribution_from_mlx_logits(logits, config)
+    return sample_from_distribution(probs, rng), probs
+
+
+def _sample_draft_from_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    need_distribution: bool,
+) -> tuple[int, np.ndarray | SparseDistribution | None]:
+    if config.temperature > 0:
+        return _sample_from_logits(logits, config, rng)
+    _eval(logits)
+    token = int(mx.argmax(logits, axis=-1).item())
+    if not need_distribution:
+        return token, None
+    return token, SparseDistribution.one_hot(token, int(logits.shape[-1]))
+
+
+def _env_scaled_draft_sampler(
+    sampler: SamplerConfig,
+    draft_sampler: SamplerConfig | None,
+) -> SamplerConfig:
+    base = draft_sampler or sampler
+    raw = os.environ.get("MTPLX_DRAFT_TEMPERATURE_SCALE")
+    if raw is None or raw.strip() == "":
+        return base
+    try:
+        scale = float(raw)
+    except ValueError:
+        return base
+    if scale <= 0 or base.temperature <= 0:
+        return base
+    return SamplerConfig(
+        temperature=float(base.temperature) * scale,
+        top_p=float(base.top_p),
+        top_k=int(base.top_k),
+    )
+
+
+def _sample_adapter_ensemble_q(
+    base_logits: mx.array,
+    adapter_logits: mx.array,
+    *,
+    epsilon: float,
+    rng: np.random.Generator,
+) -> tuple[int, SparseDistribution, dict[str, Any]]:
+    """Sample a two-candidate exact proposal q from base and adapter argmaxes."""
+    if not 0.0 <= epsilon <= 1.0:
+        raise ValueError("adapter ensemble epsilon must be in [0, 1]")
+    _eval(base_logits, adapter_logits)
+    base_token = int(mx.argmax(base_logits, axis=-1).item())
+    adapter_token = int(mx.argmax(adapter_logits, axis=-1).item())
+    vocab_size = int(adapter_logits.shape[-1])
+    if adapter_token == base_token or epsilon <= 0.0:
+        q = SparseDistribution.one_hot(base_token, vocab_size)
+        token = base_token
+        selected = "shared"
+    elif epsilon >= 1.0:
+        q = SparseDistribution.one_hot(adapter_token, vocab_size)
+        token = adapter_token
+        selected = "adapter"
+    else:
+        q = SparseDistribution(
+            np.array([base_token, adapter_token], dtype=np.int64),
+            np.array([1.0 - float(epsilon), float(epsilon)], dtype=np.float64),
+            vocab_size,
+        )
+        token = sample_from_distribution(q, rng)
+        selected = "adapter" if token == adapter_token else "base"
+    return token, q, {
+        "base_token": base_token,
+        "adapter_token": adapter_token,
+        "epsilon": float(epsilon),
+        "changed": bool(adapter_token != base_token),
+        "selected": selected,
+        "q_token_ids": [int(token_id) for token_id in q.token_ids],
+        "q_probs": [float(prob) for prob in q.probs],
+    }
+
+
+def _distribution_argmax(distribution: np.ndarray | SparseDistribution) -> int:
+    if isinstance(distribution, SparseDistribution):
+        return int(distribution.token_ids[int(np.argmax(distribution.probs))])
+    return int(np.argmax(np.asarray(distribution, dtype=np.float64)))
+
+
+def _online_correction_cache_key(
+    policy: str,
+    *,
+    depth: int,
+    primary: int,
+    source_token: int,
+    draft_prefix: list[int],
+) -> tuple[int, ...]:
+    if policy == "local_prefix":
+        return tuple([int(depth), int(primary), *[int(token) for token in draft_prefix]])
+    if policy == "source_token":
+        return (int(depth), int(source_token))
+    if policy == "primary_source":
+        return (int(depth), int(primary), int(source_token))
+    raise ValueError(
+        "online_correction_cache_key must be one of "
+        "'local_prefix', 'source_token', or 'primary_source'"
+    )
+
+
+def _seed_prompt_correction_cache(
+    prompt_ids: list[int],
+    *,
+    max_depth: int,
+    min_depth: int,
+    key_policy: str,
+) -> tuple[dict[tuple[int, ...], int], dict[str, int]]:
+    """Seed exact proposal overrides from prompt-local n-gram continuations."""
+    if key_policy != "local_prefix":
+        return {}, {"stores": 0, "collisions": 0, "skipped": 1}
+    seeded: dict[tuple[int, ...], int] = {}
+    collisions = 0
+    lower = max(1, int(min_depth))
+    upper = max(lower, int(max_depth))
+    for depth in range(lower, upper + 1):
+        if len(prompt_ids) <= depth:
+            continue
+        for start in range(0, len(prompt_ids) - depth):
+            key = tuple(
+                [int(depth), int(prompt_ids[start])]
+                + [int(token) for token in prompt_ids[start + 1 : start + depth]]
+            )
+            if key in seeded and seeded[key] != int(prompt_ids[start + depth]):
+                collisions += 1
+            seeded[key] = int(prompt_ids[start + depth])
+    return seeded, {
+        "stores": len(seeded),
+        "collisions": collisions,
+        "skipped": 0,
+    }
+
+
+def _reset_tensor_offset_cache(cache: Any) -> None:
+    for entry in cache or []:
+        if hasattr(entry, "offset"):
+            entry.offset = 0
+        if hasattr(entry, "rollback_state"):
+            entry.rollback_state = [None, None, None]
+
+
+def _make_device_d2_draft_core(
+    rt: MTPLXRuntime,
+    hidden: mx.array,
+    token_ids: mx.array,
+    *,
+    mtp_hidden_variant: str,
+) -> dict[str, Any]:
+    mtp_cache = rt.make_mtp_cache()
+    logits, draft_hidden = rt.draft_mtp(
+        hidden,
+        token_ids,
+        mtp_cache=mtp_cache,
+        return_hidden=True,
+        mtp_hidden_variant=mtp_hidden_variant,
+        mtp_depth=1,
+    )
+    _eval(logits, draft_hidden)
+    promoted, failures = promote_kv_cache_offsets(mtp_cache, reserve_tokens=4)
+    _reset_tensor_offset_cache(mtp_cache)
+
+    def draft2_fn(hidden_states, first_token_ids):
+        logits1, hidden1 = rt.draft_mtp(
+            hidden_states,
+            first_token_ids,
+            mtp_cache=mtp_cache,
+            return_hidden=True,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_depth=1,
+        )
+        token1 = mx.argmax(logits1[:, -1, :], axis=-1).reshape(1, 1)
+        logits2, _hidden2 = rt.draft_mtp(
+            hidden1[:, -1:, :],
+            token1,
+            mtp_cache=mtp_cache,
+            return_hidden=True,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_depth=2,
+        )
+        token2 = mx.argmax(logits2[:, -1, :], axis=-1).reshape(1, 1)
+        return token1, token2
+
+    compiled = mx.compile(
+        draft2_fn,
+        inputs=cache_array_tree(mtp_cache),
+        outputs=cache_array_tree(mtp_cache),
+    )
+    smoke = compiled(hidden, token_ids)
+    _eval(smoke)
+    _reset_tensor_offset_cache(mtp_cache)
+    return {
+        "fn": compiled,
+        "cache": mtp_cache,
+        "promoted": promoted,
+        "promotion_failures": failures,
+    }
+
+
+def _run_device_d2_draft_core(
+    core: dict[str, Any],
+    hidden: mx.array,
+    primary: int,
+) -> list[int]:
+    _reset_tensor_offset_cache(core["cache"])
+    result = core["fn"](hidden, mx.array([[primary]]))
+    _eval(result)
+    token1, token2 = result
+    return [
+        int(token1.reshape(-1)[0].item()),
+        int(token2.reshape(-1)[0].item()),
+    ]
+
+
+def _draft_confidence_metrics(logits: mx.array, *, topk: int = 8) -> dict[str, float]:
+    k = max(2, min(int(topk), int(logits.shape[-1])))
+    top_values = mx.topk(logits.astype(mx.float32), k)
+    _eval(top_values)
+    values = np.sort(np.asarray(top_values, dtype=np.float32).reshape(-1))
+    if values.size < 2:
+        return {"top2_margin": 0.0, "top1_prob_topk": 1.0, "entropy_topk": 0.0}
+    descending = values[::-1].astype(np.float64)
+    shifted = descending - float(descending[0])
+    exp_values = np.exp(shifted)
+    probs = exp_values / float(np.sum(exp_values))
+    entropy = -float(np.sum(probs * np.log(np.maximum(probs, 1e-30))))
+    return {
+        "top2_margin": float(values[-1] - values[-2]),
+        "top1_prob_topk": float(probs[0]),
+        "entropy_topk": entropy,
+    }
+
+
+def _top2_margin(logits: mx.array) -> float:
+    return _draft_confidence_metrics(logits, topk=2)["top2_margin"]
+
+
+def _prefill(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    return_hidden: bool,
+    abort_check: Callable[[], bool] | None = None,
+):
+    if not prompt_ids:
+        raise ValueError("prompt_ids must not be empty")
+
+    _check_postcommit_abort(abort_check)
+    cache = _make_target_prefill_cache(rt)
+    target_forward_time = 0.0
+    final_logits_only = _final_logits_prefill_enabled()
+
+    if len(prompt_ids) > 1:
+        body = prompt_ids[:-1]
+        body_array = mx.array([body])
+        for start, end in _iter_prefill_chunk_spans(len(body)):
+            _check_postcommit_abort(abort_check)
+            chunk_array = body_array[:, start:end]
+            started = time.perf_counter()
+            with attention_phase("prefill"):
+                prefill = _prefill_cache_only_forward(rt, chunk_array, cache)
+            if prefill is None:
+                _eval_cache_roots(cache)
+            else:
+                _eval(prefill)
+            _runtime_count(rt, "prefill_chunks")
+            target_forward_time += time.perf_counter() - started
+            target_forward_time += _prefill_chunk_cache_cleanup(rt)
+            _check_postcommit_abort(abort_check)
+
+    started = time.perf_counter()
+    _check_postcommit_abort(abort_check)
+    with attention_phase("prefill"):
+        result = rt.forward_ar(
+            mx.array([[prompt_ids[-1]]]),
+            cache=cache,
+            return_hidden=return_hidden,
+            emit_logits=True,
+            logits_keep=1 if final_logits_only else None,
+        )
+    if return_hidden:
+        logits, hidden = result
+        _eval(logits, hidden)
+        hidden = hidden[:, -1:, :]
+    else:
+        logits = result
+        hidden = None
+        _eval(logits)
+    target_forward_time += time.perf_counter() - started
+    target_forward_time += _maybe_repage_target_prefill_cache(cache)
+    _check_postcommit_abort(abort_check)
+    return cache, logits[:, -1, :], hidden, target_forward_time
+
+
+def _prefill_committed_mtp_history_streaming(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    mtp_hidden_variant: str,
+    history_window_tokens: int | None = None,
+    abort_check: Callable[[], bool] | None = None,
+):
+    if not prompt_ids:
+        raise ValueError("prompt_ids must not be empty")
+
+    _check_postcommit_abort(abort_check)
+    cache = _make_target_prefill_cache(rt)
+    mtp_history_cache = rt.make_mtp_cache()
+    target_forward_time = 0.0
+    prompt_history_time = 0.0
+    final_logits_only = _final_logits_prefill_enabled()
+    body = prompt_ids[:-1]
+    history_start_token_index = 1
+    mtp_history_position_base = 0
+    if history_window_tokens is not None:
+        window = max(1, int(history_window_tokens))
+        history_start_token_index = max(1, len(prompt_ids) - window)
+        mtp_history_position_base = max(0, history_start_token_index - 1)
+
+    cursor = 0
+    body_array = mx.array([body]) if body else None
+    for start, end in _iter_prefill_chunk_spans(len(body)):
+        _check_postcommit_abort(abort_check)
+        chunk_array = body_array[:, start:end]
+        chunk_len = end - start
+        token_start_index = cursor + 1
+        token_end_index = token_start_index + chunk_len
+        needs_history_hidden = (
+            history_window_tokens is None
+            or token_end_index > history_start_token_index
+        )
+        started = time.perf_counter()
+        with attention_phase("prefill"):
+            if needs_history_hidden:
+                logits_chunk, hidden_chunk = rt.forward_ar(
+                    chunk_array,
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=mtp_hidden_variant,
+                    emit_logits=not final_logits_only,
+                )
+            else:
+                hidden_chunk = None
+                logits_chunk = _prefill_cache_only_forward(rt, chunk_array, cache)
+        if hidden_chunk is None:
+            if logits_chunk is None:
+                _eval_cache_roots(cache)
+            else:
+                _eval(logits_chunk)
+        elif logits_chunk is None:
+            _eval(hidden_chunk)
+        else:
+            _eval(logits_chunk, hidden_chunk)
+        target_forward_time += time.perf_counter() - started
+        _runtime_count(rt, "prefill_chunks")
+        _check_postcommit_abort(abort_check)
+
+        if hidden_chunk is not None:
+            token_ids = prompt_ids[token_start_index : token_start_index + chunk_len]
+            slice_start = max(0, history_start_token_index - token_start_index)
+            if slice_start < len(token_ids):
+                sliced_token_ids = token_ids[slice_start:]
+                sliced_hidden = hidden_chunk[
+                    :,
+                    slice_start : slice_start + len(sliced_token_ids),
+                    :,
+                ]
+                prompt_history_time += _append_mtp_history(
+                    rt,
+                    mtp_history_cache,
+                    sliced_hidden,
+                    sliced_token_ids,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    position_offset=(
+                        token_start_index + slice_start - 1
+                        if history_window_tokens is not None
+                        else None
+                    ),
+                    force_eval=True,
+                )
+                _check_postcommit_abort(abort_check)
+        cursor += chunk_len
+        del hidden_chunk
+        del logits_chunk
+        target_forward_time += _prefill_chunk_cache_cleanup(rt)
+        _check_postcommit_abort(abort_check)
+
+    started = time.perf_counter()
+    _check_postcommit_abort(abort_check)
+    with attention_phase("prefill"):
+        logits, hidden = rt.forward_ar(
+            mx.array([[prompt_ids[-1]]]),
+            cache=cache,
+            return_hidden=True,
+            hidden_variant=mtp_hidden_variant,
+            emit_logits=True,
+            logits_keep=1 if final_logits_only else None,
+        )
+    _eval(logits, hidden)
+    target_forward_time += time.perf_counter() - started
+    target_forward_time += _maybe_repage_target_prefill_cache(cache)
+    _check_postcommit_abort(abort_check)
+    return (
+        cache,
+        logits[:, -1, :],
+        hidden[:, -1:, :],
+        mtp_history_cache,
+        target_forward_time,
+        prompt_history_time,
+        mtp_history_position_base,
+    )
+
+
+def _prefill_with_hidden_sequence(rt: MTPLXRuntime, prompt_ids: list[int]):
+    if not prompt_ids:
+        raise ValueError("prompt_ids must not be empty")
+
+    cache = _make_target_prefill_cache(rt)
+    started = time.perf_counter()
+    with attention_phase("prefill"):
+        logits, hidden = rt.forward_ar(
+            mx.array([prompt_ids]),
+            cache=cache,
+            return_hidden=True,
+            emit_logits=True,
+            logits_keep=1 if _final_logits_prefill_enabled() else None,
+        )
+    _eval(logits, hidden)
+    target_forward_time = time.perf_counter() - started
+    target_forward_time += _maybe_repage_target_prefill_cache(cache)
+    return cache, logits[:, -1, :], hidden[:, -1:, :], hidden, target_forward_time
+
+
+def _mtp_cache_offset(mtp_cache) -> int:
+    if not mtp_cache:
+        return 0
+    return int(getattr(mtp_cache[0], "offset", 0))
+
+
+def _mtp_position_offset(
+    cache_offset: int,
+    *,
+    mode: str,
+    cap: int,
+    period: int,
+    base: int = 0,
+) -> int | None:
+    """Map an MTP-cache offset to an explicit draft-side RoPE offset.
+
+    ``None`` preserves the stock MLX behavior where the KV cache owns the
+    offset. Non-default modes are proposal-only diagnostics: target verify and
+    residual correction remain authoritative.
+    """
+
+    normalized = (mode or "default").strip().lower().replace("-", "_")
+    offset = max(0, int(cache_offset))
+    if normalized in {"", "0", "off", "false", "default", "cache"}:
+        return None
+    if normalized == "absolute":
+        return offset
+    if normalized in {"cap", "capped", "clamp", "clamped"}:
+        if cap <= 0:
+            return None
+        return min(offset, int(cap))
+    if normalized in {"mod", "modulo", "wrap", "wrapped"}:
+        if period <= 0:
+            return None
+        anchor = max(0, int(base))
+        if offset < anchor:
+            return offset
+        return anchor + ((offset - anchor) % int(period))
+    raise ValueError(f"unknown MTPLX_MTP_POSITION_MODE: {mode!r}")
+
+
+def _rollback_mtp_cache(mtp_cache, offset: int) -> None:
+    if not mtp_cache:
+        return
+    for cache in mtp_cache:
+        current = int(getattr(cache, "offset", 0))
+        trim = max(0, current - offset)
+        if trim and hasattr(cache, "trim"):
+            cache.trim(trim)
+
+
+def _add_timing(event: dict, key: str, elapsed_s: float) -> None:
+    timings = event.setdefault("timing_s", {})
+    timings[key] = timings.get(key, 0.0) + elapsed_s
+
+
+def _reject_repair_breakdown(events: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, float]]:
+    counts: dict[str, int] = {}
+    repair_times: dict[str, float] = {}
+    for event in events:
+        rejected_at_depth = event.get("rejected_at_depth")
+        if rejected_at_depth is None:
+            continue
+        key = f"reject_depth_{int(rejected_at_depth)}"
+        counts[key] = counts.get(key, 0) + 1
+        timing = event.get("timing_s", {})
+        repair_time = float(timing.get("repair_forward", 0.0))
+        if repair_time:
+            repair_times[key] = repair_times.get(key, 0.0) + repair_time
+    return counts, repair_times
+
+
+def _mean_accept_probability_by_depth(
+    sums: list[float],
+    drafted: list[int],
+) -> list[float | None]:
+    return [
+        (float(total) / int(count) if count else None)
+        for total, count in zip(sums, drafted)
+    ]
+
+
+def _append_mtp_history(
+    rt: MTPLXRuntime,
+    mtp_cache,
+    hidden_states: mx.array,
+    token_ids: list[int],
+    *,
+    mtp_hidden_variant: str,
+    position_offset: int | None = None,
+    force_eval: bool = False,
+) -> float:
+    if not token_ids:
+        return 0.0
+    if hidden_states.shape[1] != len(token_ids):
+        raise ValueError("hidden_states length must match token_ids length")
+    _runtime_count(rt, "mtp_history_append_calls")
+    started = time.perf_counter()
+    hidden = rt.update_mtp_cache(
+        hidden_states,
+        mx.array([token_ids]),
+        mtp_cache=mtp_cache,
+        position_offset=position_offset,
+    )
+    if os.environ.get("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
+        return time.perf_counter() - started
+    _eval(hidden)
+    return time.perf_counter() - started
+
+
+def generate_ar(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    sampler: SamplerConfig,
+    seed: int = 0,
+    stop_token_ids: set[int] | None = None,
+    token_callback: Callable[[list[int]], None] | None = None,
+    trace_label: str | None = None,
+    trace_metadata: dict[str, Any] | None = None,
+) -> GenerationOutput:
+    counter_start = _runtime_counter_snapshot(rt)
+    rng = np.random.default_rng(seed)
+    stop_token_ids = _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
+    started_all = time.perf_counter()
+    ar_return_hidden = bool(
+        rt.mtp_enabled
+        and (
+            _env_truthy("MTPLX_AR_RETURN_HIDDEN")
+            or _env_truthy("MTPLX_DIAGNOSTIC_AR_RETURN_HIDDEN")
+        )
+    )
+    cache, logits, hidden, prompt_eval_time = _prefill(
+        rt,
+        prompt_ids,
+        return_hidden=ar_return_hidden,
+    )
+    tokens: list[int] = []
+    events: list[dict] = []
+    target_decode_time = 0.0
+    target_forward_graph_time = 0.0
+    target_eval_time = 0.0
+    verify_calls = 0
+    trace = _DecodeTrace(
+        prompt_tokens=len(prompt_ids),
+        max_tokens=max_tokens,
+        speculative_depth=0,
+        sampler=sampler,
+        verify_strategy="ar",
+        verify_core="stock",
+        mtp_history_policy="none",
+        mtp_cache_policy="none",
+        trace_label=trace_label,
+        trace_metadata={**(trace_metadata or {}), "generation_mode": "ar"},
+    )
+
+    def trace_totals() -> dict[str, Any]:
+        return {
+            "generated_tokens": len(tokens),
+            "accepted_drafts": 0,
+            "rejected_drafts": 0,
+            "drafted_tokens": 0,
+            "verify_calls": verify_calls,
+            "correction_tokens": 0,
+            "bonus_tokens": 0,
+            "verify_time_s": target_decode_time,
+            "verify_forward_time_s": target_forward_graph_time,
+            "verify_eval_time_s": target_eval_time,
+            "verify_logits_eval_time_s": 0.0,
+            "verify_hidden_eval_time_s": 0.0,
+            "verify_joint_eval_time_s": target_eval_time,
+            "verify_target_distribution_time_s": 0.0,
+            "verify_eval_unattributed_time_s": 0.0,
+            "draft_time_s": 0.0,
+            "accept_time_s": 0.0,
+            "repair_time_s": 0.0,
+            "commit_time_s": 0.0,
+            "capture_commit_time_s": 0.0,
+            "snapshot_time_s": 0.0,
+            "bonus_time_s": 0.0,
+            "verify_output_nbytes": 0,
+            "draft_output_nbytes": 0,
+            "mtp_history_append_nbytes": 0,
+            "clear_cache_events": 0,
+            "clear_cache_time_s": 0.0,
+            "trunk_cache_materialize_events": 0,
+            "trunk_cache_materialize_time_s": 0.0,
+            "dirty_detach_events": 0,
+            "dirty_detach_time_s": 0.0,
+            "dirty_detach_arrays": 0,
+            "dirty_detach_bytes": 0,
+            "live_output_detach_events": 0,
+            "live_output_detach_time_s": 0.0,
+            "live_output_detach_arrays": 0,
+            "live_output_detach_bytes": 0,
+            "state_rebase_events": 0,
+            "state_rebase_time_s": 0.0,
+            "state_root_eval_events": 0,
+            "state_root_eval_time_s": 0.0,
+            "state_root_eval_arrays": 0,
+            "trace_accounting_time_s": 0.0,
+            "accepted_by_depth": [],
+            "drafted_by_depth": [],
+            "accept_probability_sum_by_depth": [],
+        }
+
+    def emit_trace(*, force: bool = False, final: bool = False) -> None:
+        trace.maybe_emit(
+            force=force,
+            final=final,
+            totals=trace_totals(),
+            cache=cache,
+            mtp_cache=None,
+            mtp_history_materialize_every=0,
+            mtp_history_materialize_events=0,
+        )
+
+    def emit_token(token: int) -> None:
+        if token_callback is not None and not _is_stop(int(token), stop_token_ids):
+            token_callback([int(token)])
+        emit_trace()
+
+    for step in range(max_tokens):
+        token, _ = _sample_from_logits(logits[0], sampler, rng)
+        tokens.append(token)
+        emit_token(token)
+        events.append({"step": step, "token": token})
+        if step + 1 >= max_tokens or _is_stop(token, stop_token_ids):
+            break
+
+        started = time.perf_counter()
+        with attention_phase("ar_decode"):
+            result_next = rt.forward_ar(
+                mx.array([[token]]),
+                cache=cache,
+                return_hidden=ar_return_hidden,
+            )
+        if ar_return_hidden:
+            logits_next, hidden_next = result_next
+        else:
+            logits_next = result_next
+            hidden_next = None
+        forward_graph_elapsed = time.perf_counter() - started
+        eval_started = time.perf_counter()
+        if hidden_next is None:
+            _eval(logits_next)
+        else:
+            _eval(logits_next, hidden_next)
+        eval_elapsed = time.perf_counter() - eval_started
+        elapsed_decode = time.perf_counter() - started
+        target_decode_time += elapsed_decode
+        target_forward_graph_time += forward_graph_elapsed
+        target_eval_time += eval_elapsed
+        verify_calls += 1
+        logits = logits_next[:, -1, :]
+
+    elapsed = time.perf_counter() - started_all
+    emit_trace(force=True, final=True)
+    stats = GenerationStats(
+        mode="ar",
+        generated_tokens=len(tokens),
+        elapsed_s=elapsed,
+        tok_s=len(tokens) / elapsed if elapsed else 0.0,
+        target_forward_time_s=prompt_eval_time + target_decode_time,
+        prompt_eval_time_s=prompt_eval_time,
+        prompt_tps=(
+            len(prompt_ids) / prompt_eval_time if prompt_eval_time > 0 else 0.0
+        ),
+        prompt_target_prefill_time_s=prompt_eval_time,
+        prompt_target_prefill_tok_s=(
+            len(prompt_ids) / prompt_eval_time if prompt_eval_time > 0 else 0.0
+        ),
+        verify_time_s=target_decode_time,
+        verify_forward_time_s=target_forward_graph_time,
+        verify_eval_time_s=target_eval_time,
+        verify_joint_eval_time_s=target_eval_time,
+        verify_calls=verify_calls,
+        peak_memory_bytes=mx.get_peak_memory(),
+        decode_trace_path=str(trace.path) if trace.path is not None else None,
+        decode_trace_run_id=trace.run_id if trace.enabled else None,
+        events=events,
+    )
+    _attach_runtime_diagnostics(
+        stats,
+        rt,
+        counter_start,
+        ar_return_hidden=ar_return_hidden,
+    )
+    return GenerationOutput(
+        tokens=tokens,
+        text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
+        stats=stats,
+    )
+
+
+def generate_mtp1(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    sampler: SamplerConfig,
+    seed: int = 0,
+    stop_token_ids: set[int] | None = None,
+    draft_sampler: SamplerConfig | None = None,
+    verify_strategy: VerifyStrategy = "batched",
+    verify_core: str = "stock",
+    draft_margin_threshold: float | None = None,
+) -> GenerationOutput:
+    if not rt.mtp_enabled:
+        raise RuntimeError("generate_mtp1 requires an MTP-enabled runtime")
+    if verify_strategy not in {
+        "batched",
+        "sequential",
+        "capture",
+        "capture_commit",
+        "graphbank",
+        "graphbank_capture_commit",
+    }:
+        raise ValueError(
+            "verify_strategy must be 'batched', 'sequential', 'capture', "
+            "'capture_commit', 'graphbank', or 'graphbank_capture_commit'"
+        )
+    counter_start = _runtime_counter_snapshot(rt)
+    verify_core_backend = resolve_gdn_capture_backend(verify_core)
+
+    rng = np.random.default_rng(seed)
+    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
+    stop_token_ids = _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
+    started_all = time.perf_counter()
+    cache, logits, hidden, target_time = _prefill(rt, prompt_ids, return_hidden=True)
+    graphbank = (
+        SpecDecodeGraphBank(rt, capture_backend=verify_core_backend)
+        if verify_strategy in {"graphbank", "graphbank_capture_commit"}
+        else None
+    )
+    tokens: list[int] = []
+    events: list[dict] = []
+    accepted = rejected = drafted = 0
+    skipped = 0
+    draft_time = verify_time = 0.0
+    verify_forward_time = 0.0
+    verify_eval_time = 0.0
+    snapshot_time = accept_time = rollback_time = repair_time = 0.0
+    commit_time = capture_commit_time = 0.0
+    bonus_time = 0.0
+    bonus_tokens = correction_tokens = verify_calls = 0
+    accept_probability_sum_by_depth = [0.0]
+    deferred_correction_repairs = 0
+    pending_primary: int | None = None
+
+    step = 0
+    while len(tokens) < max_tokens:
+        primary_already_emitted = pending_primary is not None
+        if pending_primary is None:
+            primary, _ = _sample_from_logits(logits[0], sampler, rng)
+            tokens.append(primary)
+        else:
+            primary = pending_primary
+            pending_primary = None
+        event = {
+            "step": step,
+            "primary": primary,
+            "accepted": None,
+            "primary_already_emitted": primary_already_emitted,
+            "verify_core": verify_core_backend.replace("_", "-"),
+        }
+        step += 1
+        if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
+            events.append(event)
+            break
+
+        started = time.perf_counter()
+        draft_logits = rt.draft_mtp(
+            hidden,
+            mx.array([[primary]]),
+            mtp_cache=rt.make_mtp_cache(),
+        )
+        draft_timed = False
+        elapsed_draft = 0.0
+        if draft_margin_threshold is not None or draft_sampler.temperature <= 0:
+            _eval(draft_logits)
+            elapsed_draft = time.perf_counter() - started
+            draft_time += elapsed_draft
+            draft_timed = True
+        if draft_margin_threshold is not None:
+            margin = _top2_margin(draft_logits[:, -1, :][0])
+            event["top2_margin"] = margin
+            if margin < draft_margin_threshold:
+                _add_timing(event, "draft", elapsed_draft)
+                skipped += 1
+                event["accepted"] = None
+                event["speculation_skipped"] = True
+                event["verify_strategy"] = verify_strategy
+                started = time.perf_counter()
+                with attention_phase("decode_verify"):
+                    logits_next, hidden_next = rt.forward_ar(
+                        mx.array([[primary]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                _eval(logits_next, hidden_next)
+                elapsed_commit = time.perf_counter() - started
+                target_time += elapsed_commit
+                commit_time += elapsed_commit
+                _add_timing(event, "skip_forward", elapsed_commit)
+                logits = logits_next[:, -1, :]
+                hidden = hidden_next[:, -1:, :]
+                events.append(event)
+                continue
+        draft_token, draft_q = _sample_draft_from_logits(
+            draft_logits[:, -1, :][0],
+            draft_sampler,
+            rng,
+            need_distribution=sampler.temperature > 0,
+        )
+        if not draft_timed:
+            elapsed_draft = time.perf_counter() - started
+            draft_time += elapsed_draft
+            _add_timing(event, "draft", elapsed_draft)
+        else:
+            _add_timing(event, "draft", elapsed_draft)
+        drafted += 1
+        event["draft"] = draft_token
+
+        if verify_strategy == "sequential":
+            started = time.perf_counter()
+            with attention_phase("decode_verify"):
+                verify_logits, verify_hidden = rt.forward_ar(
+                    mx.array([[primary]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+            _eval(verify_logits, verify_hidden)
+            elapsed_verify = time.perf_counter() - started
+            verify_time += elapsed_verify
+            target_time += elapsed_verify
+            verify_calls += 1
+
+            target_logits_for_draft = verify_logits[:, -1, :]
+            started_accept = time.perf_counter()
+            if sampler.temperature <= 0:
+                target_token = int(mx.argmax(target_logits_for_draft[0], axis=-1).item())
+                accepted_now = draft_token == target_token
+                correction = target_token
+                accept_probability = 1.0 if accepted_now else 0.0
+            else:
+                target_p = _distribution_from_mlx_logits(target_logits_for_draft[0], sampler)
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires a draft distribution")
+                accept_prob = compute_acceptance_probability(
+                    target_p,
+                    draft_q,
+                    draft_token,
+                )
+                accepted_now = float(rng.random()) <= accept_prob
+                correction = (
+                    draft_token
+                    if accepted_now
+                    else sample_from_distribution(residual_distribution(target_p, draft_q), rng)
+                )
+            elapsed_accept = time.perf_counter() - started_accept
+            accept_time += elapsed_accept
+            _add_timing(event, "accept", elapsed_accept)
+
+            event["accepted"] = accepted_now
+            event["accept_probability"] = float(accept_prob if sampler.temperature > 0 else accept_probability)
+            event["correction"] = int(correction)
+            event["verify_strategy"] = verify_strategy
+            accept_probability_sum_by_depth[0] += float(event["accept_probability"])
+
+            if accepted_now:
+                accepted += 1
+                tokens.append(draft_token)
+                started = time.perf_counter()
+                with attention_phase("decode_verify"):
+                    logits_next, hidden_next = rt.forward_ar(
+                        mx.array([[draft_token]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                _eval(logits_next, hidden_next)
+                elapsed_commit = time.perf_counter() - started
+                verify_time += elapsed_commit
+                target_time += elapsed_commit
+                commit_time += elapsed_commit
+                _add_timing(event, "commit_forward", elapsed_commit)
+                logits = logits_next[:, -1, :]
+                hidden = hidden_next[:, -1:, :]
+                if _is_stop(draft_token, stop_token_ids):
+                    events.append(event)
+                    break
+            elif sampler.temperature <= 0:
+                rejected += 1
+                logits = verify_logits[:, -1, :]
+                hidden = verify_hidden[:, -1:, :]
+            else:
+                rejected += 1
+                correction_tokens += 1
+                tokens.append(int(correction))
+                started = time.perf_counter()
+                with attention_phase("decode_verify"):
+                    logits_next, hidden_next = rt.forward_ar(
+                        mx.array([[int(correction)]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                _eval(logits_next, hidden_next)
+                elapsed_repair = time.perf_counter() - started
+                target_time += elapsed_repair
+                repair_time += elapsed_repair
+                _add_timing(event, "repair_forward", elapsed_repair)
+                logits = logits_next[:, -1, :]
+                hidden = hidden_next[:, -1:, :]
+                if _is_stop(int(correction), stop_token_ids):
+                    events.append(event)
+                    break
+
+            events.append(event)
+            continue
+
+        started = time.perf_counter()
+        before_verify = snapshot_untrimmable_cache(cache)
+        elapsed_snapshot = time.perf_counter() - started
+        snapshot_time += elapsed_snapshot
+        _add_timing(event, "snapshot", elapsed_snapshot)
+        captures = None
+        if verify_strategy in {"capture", "capture_commit", "graphbank_capture_commit"}:
+            started = time.perf_counter()
+            with attention_phase("decode_verify"):
+                if graphbank is not None:
+                    verify_logits, verify_hidden, captures = graphbank.forward_ar_capture(
+                        mx.array([[primary, draft_token]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                else:
+                    verify_logits, verify_hidden, captures = rt.forward_ar_capture(
+                        mx.array([[primary, draft_token]]),
+                        cache=cache,
+                        return_hidden=True,
+                        capture_backend=verify_core_backend,
+                    )
+            _eval_verify_outputs(verify_logits, verify_hidden, captures)
+            elapsed_verify = time.perf_counter() - started
+            verify_time += elapsed_verify
+            target_time += elapsed_verify
+            verify_calls += 1
+            if graphbank is not None:
+                event["graphbank"] = graphbank.to_dict()
+
+            target_logits_for_draft = verify_logits[:, 0, :]
+            started_accept = time.perf_counter()
+            if sampler.temperature <= 0:
+                target_token = int(mx.argmax(target_logits_for_draft[0], axis=-1).item())
+                accepted_now = draft_token == target_token
+                correction = target_token
+                accept_probability = 1.0 if accepted_now else 0.0
+            else:
+                target_p = _distribution_from_mlx_logits(target_logits_for_draft[0], sampler)
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires a draft distribution")
+                accept_prob = compute_acceptance_probability(
+                    target_p,
+                    draft_q,
+                    draft_token,
+                )
+                accepted_now = float(rng.random()) <= accept_prob
+                correction = (
+                    draft_token
+                    if accepted_now
+                    else sample_from_distribution(residual_distribution(target_p, draft_q), rng)
+                )
+            elapsed_accept = time.perf_counter() - started_accept
+            accept_time += elapsed_accept
+            _add_timing(event, "accept", elapsed_accept)
+
+            event["accepted"] = accepted_now
+            event["accept_probability"] = float(accept_prob if sampler.temperature > 0 else accept_probability)
+            event["correction"] = int(correction)
+            event["verify_strategy"] = verify_strategy
+            accept_probability_sum_by_depth[0] += float(event["accept_probability"])
+
+            if accepted_now:
+                accepted += 1
+                tokens.append(draft_token)
+                logits = verify_logits[:, 1, :]
+                hidden = verify_hidden[:, -1:, :]
+                if _is_stop(draft_token, stop_token_ids):
+                    events.append(event)
+                    break
+                if len(tokens) < max_tokens:
+                    started_bonus = time.perf_counter()
+                    bonus, _ = _sample_from_logits(logits[0], sampler, rng)
+                    elapsed_bonus = time.perf_counter() - started_bonus
+                    bonus_time += elapsed_bonus
+                    _add_timing(event, "bonus_sample", elapsed_bonus)
+                    tokens.append(bonus)
+                    pending_primary = bonus
+                    bonus_tokens += 1
+                    event["bonus_token"] = int(bonus)
+                    if _is_stop(bonus, stop_token_ids):
+                        events.append(event)
+                        break
+            else:
+                rejected += 1
+                if sampler.temperature <= 0:
+                    committed = False
+                    if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
+                        from .gdn_capture import commit_captured_prefix
+
+                        started_commit = time.perf_counter()
+                        committed = commit_captured_prefix(
+                            cache,
+                            captures,
+                            keep_tokens=1,
+                            verified_tokens=2,
+                        )
+                        elapsed_commit = time.perf_counter() - started_commit
+                        capture_commit_time += elapsed_commit
+                        _add_timing(event, "capture_commit", elapsed_commit)
+                    if committed:
+                        logits = verify_logits[:, 0, :]
+                        hidden = verify_hidden[:, 0:1, :]
+                        event["capture_repair"] = "captured_primary_commit"
+                    else:
+                        started_rollback = time.perf_counter()
+                        rollback_after_verify(cache, before_verify, verified_tokens=2)
+                        elapsed_rollback = time.perf_counter() - started_rollback
+                        rollback_time += elapsed_rollback
+                        _add_timing(event, "rollback", elapsed_rollback)
+                        started = time.perf_counter()
+                        with attention_phase("decode_verify"):
+                            logits_next, hidden_next = rt.forward_ar(
+                                mx.array([[primary]]),
+                                cache=cache,
+                                return_hidden=True,
+                            )
+                        _eval(logits_next, hidden_next)
+                        elapsed_repair = time.perf_counter() - started
+                        target_time += elapsed_repair
+                        repair_time += elapsed_repair
+                        _add_timing(event, "repair_forward", elapsed_repair)
+                        logits = logits_next[:, -1, :]
+                        hidden = hidden_next[:, -1:, :]
+                        event["capture_repair"] = "standard_primary_reforward"
+                else:
+                    correction_tokens += 1
+                    tokens.append(int(correction))
+                    committed = False
+                    if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
+                        from .gdn_capture import commit_captured_prefix
+
+                        started_commit = time.perf_counter()
+                        committed = commit_captured_prefix(
+                            cache,
+                            captures,
+                            keep_tokens=1,
+                            verified_tokens=2,
+                        )
+                        elapsed_commit = time.perf_counter() - started_commit
+                        capture_commit_time += elapsed_commit
+                        _add_timing(event, "capture_commit", elapsed_commit)
+                    if not committed:
+                        started_rollback = time.perf_counter()
+                        rollback_after_verify(cache, before_verify, verified_tokens=2)
+                        elapsed_rollback = time.perf_counter() - started_rollback
+                        rollback_time += elapsed_rollback
+                        _add_timing(event, "rollback", elapsed_rollback)
+                    if committed:
+                        logits = verify_logits[:, 0, :]
+                        hidden = verify_hidden[:, 0:1, :]
+                        pending_primary = int(correction)
+                        deferred_correction_repairs += 1
+                        event["capture_repair"] = "captured_primary_pending_correction"
+                        event["pending_primary"] = int(correction)
+                    else:
+                        started = time.perf_counter()
+                        with attention_phase("decode_verify"):
+                            logits_next, hidden_next = rt.forward_ar(
+                                mx.array([[primary, int(correction)]]),
+                                cache=cache,
+                                return_hidden=True,
+                            )
+                        event["capture_repair"] = "standard_primary_correction_reforward"
+                        _eval(logits_next, hidden_next)
+                        elapsed_repair = time.perf_counter() - started
+                        target_time += elapsed_repair
+                        repair_time += elapsed_repair
+                        _add_timing(event, "repair_forward", elapsed_repair)
+                        logits = logits_next[:, -1, :]
+                        hidden = hidden_next[:, -1:, :]
+                    if _is_stop(int(correction), stop_token_ids):
+                        events.append(event)
+                        break
+
+            events.append(event)
+            continue
+
+        started = time.perf_counter()
+        with attention_phase("decode_verify"):
+            if graphbank is not None:
+                verify_logits, verify_hidden = graphbank.forward_ar(
+                    mx.array([[primary, draft_token]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+            else:
+                verify_logits, verify_hidden = rt.forward_ar(
+                    mx.array([[primary, draft_token]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+        if captures is not None:
+            _eval_verify_outputs(verify_logits, verify_hidden, captures)
+        else:
+            _eval_verify_outputs(verify_logits, verify_hidden)
+        elapsed_verify = time.perf_counter() - started
+        verify_time += elapsed_verify
+        target_time += elapsed_verify
+        verify_calls += 1
+        if graphbank is not None:
+            event["graphbank"] = graphbank.to_dict()
+
+        target_logits_for_draft = verify_logits[:, 0, :]
+        started_accept = time.perf_counter()
+        if sampler.temperature <= 0:
+            target_token = int(mx.argmax(target_logits_for_draft[0], axis=-1).item())
+            accepted_now = draft_token == target_token
+            correction = target_token
+            accept_probability = 1.0 if accepted_now else 0.0
+        else:
+            target_p = _distribution_from_mlx_logits(target_logits_for_draft[0], sampler)
+            if draft_q is None:
+                raise RuntimeError("non-greedy MTP requires a draft distribution")
+            accept_prob = compute_acceptance_probability(
+                target_p,
+                draft_q,
+                draft_token,
+            )
+            accepted_now = float(rng.random()) <= accept_prob
+            correction = (
+                draft_token
+                if accepted_now
+                else sample_from_distribution(residual_distribution(target_p, draft_q), rng)
+            )
+        elapsed_accept = time.perf_counter() - started_accept
+        accept_time += elapsed_accept
+        _add_timing(event, "accept", elapsed_accept)
+
+        event["accepted"] = accepted_now
+        event["accept_probability"] = float(accept_prob if sampler.temperature > 0 else accept_probability)
+        event["correction"] = int(correction)
+        event["verify_strategy"] = verify_strategy
+        accept_probability_sum_by_depth[0] += float(event["accept_probability"])
+
+        if accepted_now:
+            accepted += 1
+            tokens.append(draft_token)
+            logits = verify_logits[:, 1, :]
+            hidden = verify_hidden[:, -1:, :]
+            if _is_stop(draft_token, stop_token_ids):
+                events.append(event)
+                break
+            if len(tokens) < max_tokens:
+                started_bonus = time.perf_counter()
+                bonus, _ = _sample_from_logits(logits[0], sampler, rng)
+                elapsed_bonus = time.perf_counter() - started_bonus
+                bonus_time += elapsed_bonus
+                _add_timing(event, "bonus_sample", elapsed_bonus)
+                tokens.append(bonus)
+                pending_primary = bonus
+                bonus_tokens += 1
+                event["bonus_token"] = int(bonus)
+                if _is_stop(bonus, stop_token_ids):
+                    events.append(event)
+                    break
+        elif sampler.temperature <= 0:
+            rejected += 1
+            started_rollback = time.perf_counter()
+            rollback_after_verify(cache, before_verify, verified_tokens=2)
+            elapsed_rollback = time.perf_counter() - started_rollback
+            rollback_time += elapsed_rollback
+            _add_timing(event, "rollback", elapsed_rollback)
+            started = time.perf_counter()
+            with attention_phase("decode_verify"):
+                logits_next, hidden_next = rt.forward_ar(
+                    mx.array([[primary]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+            _eval(logits_next, hidden_next)
+            elapsed_repair = time.perf_counter() - started
+            target_time += elapsed_repair
+            repair_time += elapsed_repair
+            _add_timing(event, "repair_forward", elapsed_repair)
+            logits = logits_next[:, -1, :]
+            hidden = hidden_next[:, -1:, :]
+        else:
+            rejected += 1
+            correction_tokens += 1
+            tokens.append(int(correction))
+            started_rollback = time.perf_counter()
+            rollback_after_verify(cache, before_verify, verified_tokens=2)
+            elapsed_rollback = time.perf_counter() - started_rollback
+            rollback_time += elapsed_rollback
+            _add_timing(event, "rollback", elapsed_rollback)
+            started = time.perf_counter()
+            with attention_phase("decode_verify"):
+                logits_next, hidden_next = rt.forward_ar(
+                    mx.array([[primary, int(correction)]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+            _eval(logits_next, hidden_next)
+            elapsed_repair = time.perf_counter() - started
+            target_time += elapsed_repair
+            repair_time += elapsed_repair
+            _add_timing(event, "repair_forward", elapsed_repair)
+            logits = logits_next[:, -1, :]
+            hidden = hidden_next[:, -1:, :]
+            if _is_stop(int(correction), stop_token_ids):
+                events.append(event)
+                break
+
+        events.append(event)
+
+    elapsed = time.perf_counter() - started_all
+    reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
+    stats = GenerationStats(
+        mode="mtp1",
+        generated_tokens=len(tokens),
+        elapsed_s=elapsed,
+        tok_s=len(tokens) / elapsed if elapsed else 0.0,
+        accepted_drafts=accepted,
+        rejected_drafts=rejected,
+        drafted_tokens=drafted,
+        skipped_drafts=skipped,
+        verify_time_s=verify_time,
+        verify_forward_time_s=verify_forward_time,
+        verify_eval_time_s=verify_eval_time,
+        draft_time_s=draft_time,
+        target_forward_time_s=target_time,
+        snapshot_time_s=snapshot_time,
+        accept_time_s=accept_time,
+        rollback_time_s=rollback_time,
+        repair_time_s=repair_time,
+        commit_time_s=commit_time,
+        capture_commit_time_s=capture_commit_time,
+        bonus_time_s=bonus_time,
+        peak_memory_bytes=mx.get_peak_memory(),
+        bonus_tokens=bonus_tokens,
+        correction_tokens=correction_tokens,
+        verify_calls=verify_calls,
+        accepted_by_depth=[accepted],
+        drafted_by_depth=[drafted],
+        accept_probability_sum_by_depth=accept_probability_sum_by_depth,
+        mean_accept_probability_by_depth=_mean_accept_probability_by_depth(
+            accept_probability_sum_by_depth,
+            [drafted],
+        ),
+        graphbank=graphbank.to_dict() if graphbank is not None else {},
+        reject_path_counts=reject_path_counts,
+        repair_time_by_reject_depth_s=repair_time_by_reject_depth,
+        deferred_correction_repairs=deferred_correction_repairs,
+        events=events,
+    )
+    _attach_runtime_diagnostics(stats, rt, counter_start)
+    return GenerationOutput(
+        tokens=tokens,
+        text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
+        stats=stats,
+    )
+
+
+def generate_mtpk(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    sampler: SamplerConfig,
+    speculative_depth: int,
+    seed: int = 0,
+    stop_token_ids: set[int] | None = None,
+    mtp_hidden_variant: str = "post_norm",
+    mtp_cache_policy: str = "persistent",
+    mtp_history_policy: str = "cycle",
+    draft_sampler: SamplerConfig | None = None,
+    draft_margin_threshold: float | None = None,
+    min_speculative_depth: int = 1,
+    verify_strategy: VerifyStrategy = "batched",
+    verify_core: str = "stock",
+    draft_core: str = "stock",
+    mtp_corrector: Any | None = None,
+    adaptive_policy: AdaptiveDepthPolicy | ExpectedValueDepthPolicy | None = None,
+    online_hidden_corrector_alpha: float = 0.0,
+    online_hidden_corrector_decay: float = 0.8,
+    online_hidden_corrector_warmup: int = 1,
+    online_hidden_corrector_max_feed_depth: int | None = None,
+    online_hidden_corrector_key: str = "global",
+    online_correction_cache: bool = False,
+    online_correction_cache_min_depth: int = 1,
+    online_correction_cache_key: str = "local_prefix",
+    prompt_correction_cache: bool = False,
+    prompt_correction_cache_min_depth: int = 2,
+    adapter_ensemble_q: bool = False,
+    adapter_ensemble_epsilon: float = 0.5,
+    adapter_ensemble_min_depth: int = 2,
+    mtp_topk_reranker: Any | None = None,
+    token_callback: Callable[[list[int]], None] | None = None,
+    session_bank: Any | None = None,
+    session_id: str | None = None,
+    session_restore_mode: str = "clone",
+    session_template_hash: str | None = None,
+    session_draft_head_identity: str | None = None,
+    session_policy_fingerprint: str | None = None,
+    capture_final_state: bool = False,
+    commit_prompt_state_to_bank: bool = False,
+    commit_prompt_state_keep_live_ref: bool = False,
+    trace_label: str | None = None,
+    trace_metadata: dict[str, Any] | None = None,
+) -> GenerationOutput:
+    """Generate with a fixed native-MTP depth.
+
+    The implementation is deliberately conservative: every reject restores the
+    target cache snapshot and re-forwards only the committed prefix. This keeps
+    the hybrid GDN/attention cache contract exact while we measure depth.
+    """
+    if not rt.mtp_enabled:
+        raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
+    requested_speculative_depth = int(speculative_depth)
+    if requested_speculative_depth < 1:
+        raise ValueError("speculative_depth must be >= 1")
+    if min_speculative_depth < 0:
+        raise ValueError("min_speculative_depth must be >= 0")
+    if min_speculative_depth > requested_speculative_depth:
+        raise ValueError("min_speculative_depth cannot exceed speculative_depth")
+    speculative_depth, long_context_depth_policy = resolve_long_context_mtp_depth(
+        prompt_tokens=len(prompt_ids),
+        requested_depth=requested_speculative_depth,
+        min_depth=min_speculative_depth,
+    )
+    if min_speculative_depth > speculative_depth:
+        raise ValueError("min_speculative_depth cannot exceed speculative_depth")
+    if mtp_cache_policy not in {"persistent", "fresh"}:
+        raise ValueError("mtp_cache_policy must be 'persistent' or 'fresh'")
+    mtp_history_policy = _normalize_mtp_history_policy(mtp_history_policy)
+    if online_hidden_corrector_alpha < 0:
+        raise ValueError("online_hidden_corrector_alpha must be >= 0")
+    if not 0 <= online_hidden_corrector_decay < 1:
+        raise ValueError("online_hidden_corrector_decay must be in [0, 1)")
+    if online_hidden_corrector_warmup < 0:
+        raise ValueError("online_hidden_corrector_warmup must be >= 0")
+    if (
+        online_hidden_corrector_max_feed_depth is not None
+        and online_hidden_corrector_max_feed_depth < 1
+    ):
+        raise ValueError("online_hidden_corrector_max_feed_depth must be >= 1")
+    if online_hidden_corrector_key not in {"global", "token"}:
+        raise ValueError("online_hidden_corrector_key must be 'global' or 'token'")
+    if online_correction_cache_min_depth < 1:
+        raise ValueError("online_correction_cache_min_depth must be >= 1")
+    if prompt_correction_cache_min_depth < 1:
+        raise ValueError("prompt_correction_cache_min_depth must be >= 1")
+    if online_correction_cache_key not in {"local_prefix", "source_token", "primary_source"}:
+        raise ValueError(
+            "online_correction_cache_key must be 'local_prefix', "
+            "'source_token', or 'primary_source'"
+        )
+    if draft_core not in {"stock", "device-d2"}:
+        raise ValueError("draft_core must be 'stock' or 'device-d2'")
+    if not 0.0 <= adapter_ensemble_epsilon <= 1.0:
+        raise ValueError("adapter_ensemble_epsilon must be in [0, 1]")
+    if adapter_ensemble_min_depth < 1:
+        raise ValueError("adapter_ensemble_min_depth must be >= 1")
+    if verify_strategy not in {"batched", "capture_commit", "graphbank", "graphbank_capture_commit"}:
+        raise ValueError(
+            "verify_strategy must be 'batched', 'capture_commit', "
+            "'graphbank', or 'graphbank_capture_commit'"
+        )
+    counter_start = _runtime_counter_snapshot(rt)
+    verify_core_backend = resolve_gdn_capture_backend(verify_core)
+    online_hidden_enabled = online_hidden_corrector_alpha > 0.0
+    online_hidden_max_feed_depth = (
+        max(0, speculative_depth - 1)
+        if online_hidden_corrector_max_feed_depth is None
+        else int(online_hidden_corrector_max_feed_depth)
+    )
+
+    rng = np.random.default_rng(seed)
+    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
+    if mtp_corrector is not None:
+        corrector_variant = getattr(mtp_corrector, "hidden_variant", mtp_hidden_variant)
+        if corrector_variant != mtp_hidden_variant:
+            raise ValueError(
+                f"MTP corrector expects hidden variant {corrector_variant!r}, "
+                f"but mtp_hidden_variant is {mtp_hidden_variant!r}"
+            )
+    stop_token_ids = _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
+    started_all = time.perf_counter()
+    draft_time = verify_time = 0.0
+    verify_forward_time = 0.0
+    verify_eval_time = 0.0
+    verify_logits_eval_time = 0.0
+    verify_hidden_eval_time = 0.0
+    verify_joint_eval_time = 0.0
+    verify_target_distribution_time = 0.0
+    verify_eval_unattributed_time = 0.0
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        prompt_ids,
+        mtp_hidden_variant=mtp_hidden_variant,
+        mtp_history_policy=mtp_history_policy,
+        session_bank=session_bank,
+        restore_mode=session_restore_mode,
+        template_hash=session_template_hash,
+        draft_head_identity=session_draft_head_identity,
+        policy_fingerprint=session_policy_fingerprint,
+    )
+    prompt_prefix_bank_commit: dict[str, object] = {}
+    if (
+        commit_prompt_state_to_bank
+        and session_bank is not None
+        and session_id is not None
+        and prompt_ids
+        and int(prompt_state.suffix_tokens) > 0
+    ):
+        commit_started = time.perf_counter()
+        try:
+            mtp_snapshot = (
+                snapshot_cache(prompt_state.committed_mtp_cache)
+                if prompt_state.committed_mtp_cache is not None
+                else None
+            )
+            entry = session_bank.put(
+                runtime=rt,
+                token_ids=prompt_ids,
+                cache=prompt_state.trunk_cache,
+                logits=prompt_state.logits,
+                hidden=prompt_state.hidden,
+                hidden_variant=mtp_hidden_variant,
+                keep_live_ref=bool(commit_prompt_state_keep_live_ref),
+                session_id=session_id,
+                template_hash=session_template_hash,
+                mtp_history_policy=prompt_state.mtp_history_policy,
+                draft_head_identity=session_draft_head_identity,
+                policy_fingerprint=session_policy_fingerprint,
+                mtp_history_snapshot=mtp_snapshot,
+                snapshot_epoch=len(prompt_ids),
+                mtp_snapshot_epoch=len(prompt_ids) if mtp_snapshot is not None else None,
+            )
+            prompt_prefix_bank_commit = {
+                "stored": entry is not None,
+                "mode": "prompt_prefix",
+                "reason": (
+                    "committed_prompt_prefix"
+                    if entry is not None
+                    else "sessionbank_snapshot_skipped"
+                ),
+                "prefix_len": int(entry.prefix_len if entry is not None else len(prompt_ids)),
+                "nbytes": int(entry.nbytes if entry is not None else 0),
+                "elapsed_s": time.perf_counter() - commit_started,
+                "cached_tokens": int(prompt_state.cached_tokens),
+                "suffix_tokens": int(prompt_state.suffix_tokens),
+            }
+        except BaseException as exc:
+            prompt_prefix_bank_commit = {
+                "stored": False,
+                "mode": "prompt_prefix",
+                "reason": f"prompt_prefix_commit_error:{type(exc).__name__}",
+                "elapsed_s": time.perf_counter() - commit_started,
+            }
+    cache = prompt_state.trunk_cache
+    logits = prompt_state.logits
+    hidden = prompt_state.hidden
+    mtp_history_cache = prompt_state.committed_mtp_cache
+    mtp_history_policy = prompt_state.mtp_history_policy
+    mtp_history_position_base = int(prompt_state.mtp_history_position_base)
+    prompt_eval_time = prompt_state.prompt_eval_time_s
+    prompt_target_prefill_time = max(
+        0.0, prompt_eval_time - prompt_state.prompt_mtp_history_time_s
+    )
+    target_time = prompt_target_prefill_time
+    draft_time += prompt_state.prompt_mtp_history_time_s
+    graphbank = (
+        SpecDecodeGraphBank(rt, capture_backend=verify_core_backend)
+        if verify_strategy in {"graphbank", "graphbank_capture_commit"}
+        else None
+    )
+    snapshot_time = accept_time = rollback_time = repair_time = 0.0
+    commit_time = capture_commit_time = 0.0
+    bonus_time = 0.0
+    online_hidden_corrector_time = 0.0
+    tokens: list[int] = []
+    events: list[dict] = []
+    record_events = not os.environ.get("MTPLX_DROP_EVENTS")
+    append_event = events.append if record_events else (lambda _event: None)
+    accepted = rejected = drafted = 0
+    bonus_tokens = correction_tokens = verify_calls = 0
+    accepted_by_depth = [0 for _ in range(speculative_depth)]
+    drafted_by_depth = [0 for _ in range(speculative_depth)]
+    accept_probability_sum_by_depth = [0.0 for _ in range(speculative_depth)]
+    deferred_correction_repairs = 0
+    pending_primary: int | None = None
+    online_hidden_deltas: dict[object, mx.array] = {}
+    online_hidden_update_counts: dict[object, int] = {}
+    online_hidden_apply_counts: dict[object, int] = {}
+    correction_cache: dict[tuple[int, ...], int] = {}
+    prompt_seeded_cache_keys: set[tuple[int, ...]] = set()
+    prompt_correction_cache_hits = 0
+    prompt_seed_stats = {"stores": 0, "collisions": 0, "skipped": 0}
+    if prompt_correction_cache:
+        seeded_cache, prompt_seed_stats = _seed_prompt_correction_cache(
+            prompt_ids,
+            max_depth=speculative_depth,
+            min_depth=prompt_correction_cache_min_depth,
+            key_policy=online_correction_cache_key,
+        )
+        correction_cache.update(seeded_cache)
+        prompt_seeded_cache_keys = set(seeded_cache)
+    correction_cache_hits = 0
+    correction_cache_stores = 0
+    adapter_ensemble_calls = 0
+    adapter_ensemble_changed = 0
+    adapter_ensemble_base_selected = 0
+    adapter_ensemble_adapter_selected = 0
+    adapter_ensemble_shared_selected = 0
+    adapter_ensemble_fallbacks = 0
+    topk_reranker_calls = 0
+    topk_reranker_changed = 0
+    topk_reranker_fallbacks = 0
+    topk_reranker_selected_rank_sum = 0
+    device_d2_core: dict[str, Any] | None = None
+    device_d2_compile_time = 0.0
+    device_d2_calls = 0
+    device_d2_fallbacks = 0
+    streamed_token_count = 0
+    mtp_history_materialize_every = max(
+        0,
+        int(os.environ.get("MTPLX_MTP_HISTORY_MATERIALIZE_EVERY") or 0),
+    )
+    late_depth_switch_after = max(
+        0,
+        int(os.environ.get("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS") or 0),
+    )
+    late_depth_before = int(
+        os.environ.get("MTPLX_LATE_DEPTH_BEFORE") or speculative_depth
+    )
+    late_depth_after = int(
+        os.environ.get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
+    )
+    mtp_position_mode = (
+        os.environ.get("MTPLX_MTP_POSITION_MODE") or "default"
+    ).strip().lower().replace("-", "_")
+    mtp_position_cap = max(
+        0,
+        int(os.environ.get("MTPLX_MTP_POSITION_CAP") or 4096),
+    )
+    mtp_position_period = max(
+        0,
+        int(os.environ.get("MTPLX_MTP_POSITION_PERIOD") or 4096),
+    )
+    mtp_position_base = max(
+        0,
+        int(os.environ.get("MTPLX_MTP_POSITION_BASE") or 0),
+    )
+    # Validate env spelling before a long generation starts.
+    _mtp_position_offset(
+        0,
+        mode=mtp_position_mode,
+        cap=mtp_position_cap,
+        period=mtp_position_period,
+        base=mtp_position_base,
+    )
+
+    def mtp_position_offset_for_cache(mtp_cache) -> int | None:
+        if (
+            mtp_history_position_base > 0
+            and mtp_cache is mtp_history_cache
+            and _mtp_history_uses_committed_cache(mtp_history_policy)
+        ):
+            return _mtp_cache_offset(mtp_cache) + mtp_history_position_base
+        return _mtp_position_offset(
+            _mtp_cache_offset(mtp_cache),
+            mode=mtp_position_mode,
+            cap=mtp_position_cap,
+            period=mtp_position_period,
+            base=mtp_position_base,
+        )
+
+    mtp_history_tokens_since_materialize = 0
+    mtp_history_materialize_events = 0
+    clear_cache_every = _clear_cache_every()
+    clear_cache_tokens_since = 0
+    clear_cache_observed_tokens = 0
+    clear_cache_events = 0
+    clear_cache_time_s = 0.0
+    trunk_cache_materialize_every = max(
+        0,
+        int(os.environ.get("MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY") or 0),
+    )
+    trunk_cache_materialize_tokens_since = 0
+    trunk_cache_materialize_observed_tokens = 0
+    trunk_cache_materialize_events = 0
+    trunk_cache_materialize_time_s = 0.0
+    state_rebase_every = max(
+        0,
+        int(os.environ.get("MTPLX_STATE_REBASE_EVERY") or 0),
+    )
+    state_rebase_tokens_since = 0
+    state_rebase_observed_tokens = 0
+    state_rebase_events = 0
+    state_rebase_time_s = 0.0
+    state_root_eval_enabled = bool(os.environ.get("MTPLX_EVAL_STATE_ROOTS_ON_COMMIT"))
+    state_root_eval_include_mtp = (
+        os.environ.get("MTPLX_EVAL_STATE_ROOTS_INCLUDE_MTP", "1")
+        .strip()
+        .lower()
+        not in {"0", "false", "no", "off"}
+    )
+    state_root_eval_include_live = (
+        os.environ.get("MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE", "1")
+        .strip()
+        .lower()
+        not in {"0", "false", "no", "off"}
+    )
+    defer_verify_hidden_eval = _defer_verify_hidden_eval_enabled()
+    verify_hidden_mode = _verify_hidden_mode()
+    state_root_eval_events = 0
+    state_root_eval_time_s = 0.0
+    state_root_eval_arrays = 0
+    dirty_detach_mode = (
+        os.environ.get("MTPLX_DETACH_MODE") or "selected_slice_contiguous_eval"
+    ).strip().lower().replace("-", "_")
+    dirty_detach_components_env = os.environ.get("MTPLX_DETACH_COMPONENTS") or ""
+    dirty_detach_component_filter = {
+        item.strip().lower().replace("-", "_")
+        for item in dirty_detach_components_env.split(",")
+        if item.strip()
+    }
+    dirty_detach_supported_components = {"gdn", "conv", "attn"}
+    dirty_detach_global_every = max(
+        0,
+        int(os.environ.get("MTPLX_DETACH_EVERY") or 0),
+    )
+    dirty_detach_cadences = {
+        "gdn": max(
+            0,
+            int(os.environ.get("MTPLX_DETACH_GDN_EVERY") or dirty_detach_global_every),
+        ),
+        "conv": max(
+            0,
+            int(os.environ.get("MTPLX_DETACH_CONV_EVERY") or dirty_detach_global_every),
+        ),
+        "attn": max(
+            0,
+            int(os.environ.get("MTPLX_DETACH_ATTN_EVERY") or dirty_detach_global_every),
+        ),
+    }
+    if dirty_detach_component_filter:
+        dirty_detach_cadences = {
+            key: value if key in dirty_detach_component_filter else 0
+            for key, value in dirty_detach_cadences.items()
+        }
+    dirty_detach_enabled_components = sorted(
+        component
+        for component, cadence in dirty_detach_cadences.items()
+        if component in dirty_detach_supported_components and cadence > 0
+    )
+    dirty_detach_tokens_since = {
+        component: 0 for component in dirty_detach_supported_components
+    }
+    dirty_detach_observed_tokens = 0
+    dirty_detach_events = 0
+    dirty_detach_time_s = 0.0
+    dirty_detach_arrays = 0
+    dirty_detach_bytes = 0
+    live_output_detach_enabled = bool(os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS"))
+    live_output_detach_mode = (
+        os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE")
+        or os.environ.get("MTPLX_DETACH_MODE")
+        or "contiguous_eval"
+    ).strip().lower().replace("-", "_")
+    live_output_detach_events = 0
+    live_output_detach_time_s = 0.0
+    live_output_detach_arrays = 0
+    live_output_detach_bytes = 0
+    capture_commit_detach_mode = (
+        os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_MODE")
+        or dirty_detach_mode
+    ).strip().lower().replace("-", "_")
+    capture_commit_detach_components_env = (
+        os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_COMPONENTS") or ""
+    )
+    capture_commit_detach_component_filter = {
+        item.strip().lower().replace("-", "_")
+        for item in capture_commit_detach_components_env.split(",")
+        if item.strip()
+    }
+    capture_commit_detach_global_every = max(
+        0,
+        int(os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_EVERY") or 0),
+    )
+    capture_commit_detach_cadences = {
+        "gdn": max(
+            0,
+            int(
+                os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_GDN_EVERY")
+                or capture_commit_detach_global_every
+            ),
+        ),
+        "conv": max(
+            0,
+            int(
+                os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_CONV_EVERY")
+                or capture_commit_detach_global_every
+            ),
+        ),
+    }
+    if capture_commit_detach_component_filter:
+        capture_commit_detach_cadences = {
+            key: value if key in capture_commit_detach_component_filter else 0
+            for key, value in capture_commit_detach_cadences.items()
+        }
+    capture_commit_detach_enabled_components = sorted(
+        component
+        for component, cadence in capture_commit_detach_cadences.items()
+        if component in dirty_detach_supported_components and cadence > 0
+    )
+    capture_commit_detach_tokens_since = {
+        component: 0 for component in dirty_detach_supported_components
+    }
+    capture_commit_detach_observed_tokens = 0
+    capture_commit_detach_events = 0
+    capture_commit_detach_time_s = 0.0
+    capture_commit_detach_arrays = 0
+    capture_commit_detach_bytes = 0
+    trace_verify_output_nbytes = 0
+    trace_draft_output_nbytes = 0
+    trace_mtp_history_append_nbytes = 0
+    trace_accounting_time_s = 0.0
+    trace_extra_metadata = dict(trace_metadata or {})
+    if mtp_position_mode not in {"", "0", "off", "false", "default", "cache"}:
+        trace_extra_metadata["mtp_position"] = {
+            "mode": mtp_position_mode,
+            "cap": int(mtp_position_cap),
+            "period": int(mtp_position_period),
+            "base": int(mtp_position_base),
+        }
+    if mtp_history_policy == "last_window":
+        trace_extra_metadata["mtp_history_last_window"] = {
+            "tokens": int(prompt_state.mtp_history_window_tokens),
+            "position_base": int(prompt_state.mtp_history_position_base),
+        }
+    trace = _DecodeTrace(
+        prompt_tokens=len(prompt_ids),
+        max_tokens=max_tokens,
+        speculative_depth=speculative_depth,
+        sampler=sampler,
+        verify_strategy=verify_strategy,
+        verify_core=verify_core_backend.replace("_", "-"),
+        mtp_history_policy=mtp_history_policy,
+        mtp_cache_policy=mtp_cache_policy,
+        trace_label=trace_label,
+        trace_metadata=trace_extra_metadata,
+    )
+    trace_current_mtp_cache = mtp_history_cache
+
+    def own_live_output_leaf(value: Any) -> Any:
+        nonlocal live_output_detach_events
+        nonlocal live_output_detach_time_s
+        nonlocal live_output_detach_arrays
+        nonlocal live_output_detach_bytes
+        if not live_output_detach_enabled or value is None:
+            return value
+        started_detach = time.perf_counter()
+        detached = detach_array_leaf(value, mode=live_output_detach_mode)
+        live_output_detach_time_s += time.perf_counter() - started_detach
+        if isinstance(detached, mx.array):
+            live_output_detach_events += 1
+            live_output_detach_arrays += 1
+            live_output_detach_bytes += int(detached.nbytes)
+        return detached
+
+    def own_live_logits_hidden(logit_leaf: Any, hidden_leaf: Any) -> tuple[Any, Any]:
+        return own_live_output_leaf(logit_leaf), own_live_output_leaf(hidden_leaf)
+
+    if live_output_detach_enabled:
+        logits, hidden = own_live_logits_hidden(logits, hidden)
+
+    def append_mtp_history(
+        mtp_cache,
+        hidden_states: mx.array,
+        token_ids: list[int],
+    ) -> float:
+        nonlocal mtp_history_tokens_since_materialize, mtp_history_materialize_events
+        nonlocal trace_mtp_history_append_nbytes, trace_accounting_time_s
+        if not token_ids:
+            return 0.0
+        if trace.enabled:
+            trace_accounting_started = time.perf_counter()
+            trace_mtp_history_append_nbytes += _tree_nbytes(hidden_states) + (8 * len(token_ids))
+            trace_accounting_time_s += time.perf_counter() - trace_accounting_started
+        hidden_states = own_live_output_leaf(hidden_states)
+        mtp_history_tokens_since_materialize += len(token_ids)
+        force_eval = (
+            mtp_history_materialize_every > 0
+            and mtp_history_tokens_since_materialize >= mtp_history_materialize_every
+        )
+        elapsed = _append_mtp_history(
+            rt,
+            mtp_cache,
+            hidden_states,
+            token_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            position_offset=mtp_position_offset_for_cache(mtp_cache),
+            force_eval=force_eval,
+        )
+        if force_eval:
+            mtp_history_materialize_events += 1
+            mtp_history_tokens_since_materialize = 0
+        return elapsed
+
+    def maybe_eval_state_roots(event: dict[str, Any], current_tokens: int) -> None:
+        nonlocal state_root_eval_events, state_root_eval_time_s
+        nonlocal state_root_eval_arrays
+        if not state_root_eval_enabled:
+            return
+        arrays = _tree_mx_arrays(cache)
+        if state_root_eval_include_mtp:
+            arrays.extend(_tree_mx_arrays(trace_current_mtp_cache))
+        if state_root_eval_include_live:
+            arrays.extend(_tree_mx_arrays(logits))
+            arrays.extend(_tree_mx_arrays(hidden))
+        deduped: list[mx.array] = []
+        seen_arrays: set[int] = set()
+        for array in arrays:
+            array_id = id(array)
+            if array_id in seen_arrays:
+                continue
+            seen_arrays.add(array_id)
+            deduped.append(array)
+        if not deduped:
+            return
+        started_eval = time.perf_counter()
+        _eval(*deduped)
+        elapsed_eval = time.perf_counter() - started_eval
+        state_root_eval_events += 1
+        state_root_eval_time_s += elapsed_eval
+        state_root_eval_arrays += len(deduped)
+        event["state_root_eval"] = {
+            "current_tokens": int(current_tokens),
+            "arrays": int(len(deduped)),
+            "elapsed_s": float(elapsed_eval),
+            "include_mtp": bool(state_root_eval_include_mtp),
+            "include_live": bool(state_root_eval_include_live),
+        }
+        _add_timing(event, "state_root_eval", elapsed_eval)
+
+    def maybe_rebase_decode_state(current_tokens: int) -> None:
+        nonlocal cache, logits, hidden, mtp_history_cache, trace_current_mtp_cache
+        nonlocal target_time, draft_time
+        nonlocal state_rebase_tokens_since, state_rebase_observed_tokens
+        nonlocal state_rebase_events, state_rebase_time_s
+        if state_rebase_every <= 0 or current_tokens <= 0:
+            return
+        if current_tokens < state_rebase_observed_tokens:
+            state_rebase_observed_tokens = current_tokens
+            return
+        delta_tokens = current_tokens - state_rebase_observed_tokens
+        if delta_tokens <= 0:
+            return
+        state_rebase_observed_tokens = current_tokens
+        state_rebase_tokens_since += delta_tokens
+        if state_rebase_tokens_since < state_rebase_every:
+            return
+        prefix_tokens = list(prompt_ids) + [int(token) for token in tokens[:current_tokens]]
+        started_rebase = time.perf_counter()
+        rebased = restore_or_prefill_prompt_state(
+            rt,
+            prefix_tokens,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            session_bank=None,
+        )
+        state_rebase_time_s += time.perf_counter() - started_rebase
+        state_rebase_events += 1
+        state_rebase_tokens_since = 0
+        cache = rebased.trunk_cache
+        logits = rebased.logits
+        hidden = rebased.hidden
+        mtp_history_cache = rebased.committed_mtp_cache
+        trace_current_mtp_cache = mtp_history_cache
+        target_time += max(0.0, rebased.prompt_eval_time_s - rebased.prompt_mtp_history_time_s)
+        draft_time += rebased.prompt_mtp_history_time_s
+
+    def maybe_clear_mlx_cache() -> None:
+        nonlocal clear_cache_tokens_since, clear_cache_observed_tokens
+        nonlocal clear_cache_events, clear_cache_time_s
+        if clear_cache_every <= 0:
+            return
+        current_tokens = len(tokens)
+        if current_tokens < clear_cache_observed_tokens:
+            clear_cache_observed_tokens = current_tokens
+            return
+        delta_tokens = current_tokens - clear_cache_observed_tokens
+        if delta_tokens <= 0:
+            return
+        clear_cache_observed_tokens = current_tokens
+        clear_cache_tokens_since += delta_tokens
+        if clear_cache_tokens_since < clear_cache_every:
+            return
+        started_clear = time.perf_counter()
+        try:
+            mx.synchronize()
+        except RuntimeError:
+            pass
+        mx.clear_cache()
+        clear_cache_time_s += time.perf_counter() - started_clear
+        clear_cache_events += 1
+        clear_cache_tokens_since = 0
+
+    def maybe_materialize_trunk_cache() -> None:
+        nonlocal trunk_cache_materialize_tokens_since
+        nonlocal trunk_cache_materialize_observed_tokens
+        nonlocal trunk_cache_materialize_events
+        nonlocal trunk_cache_materialize_time_s
+        if trunk_cache_materialize_every <= 0:
+            return
+        current_tokens = len(tokens)
+        if current_tokens < trunk_cache_materialize_observed_tokens:
+            trunk_cache_materialize_observed_tokens = current_tokens
+            return
+        delta_tokens = current_tokens - trunk_cache_materialize_observed_tokens
+        if delta_tokens <= 0:
+            return
+        trunk_cache_materialize_observed_tokens = current_tokens
+        trunk_cache_materialize_tokens_since += delta_tokens
+        if trunk_cache_materialize_tokens_since < trunk_cache_materialize_every:
+            return
+        arrays = _tree_mx_arrays(cache)
+        started_materialize = time.perf_counter()
+        if arrays:
+            mx.eval(*arrays)
+        trunk_cache_materialize_time_s += time.perf_counter() - started_materialize
+        trunk_cache_materialize_events += 1
+        trunk_cache_materialize_tokens_since = 0
+
+    def maybe_detach_dirty_state(current_tokens: int | None = None) -> None:
+        nonlocal dirty_detach_observed_tokens
+        nonlocal dirty_detach_events, dirty_detach_time_s
+        nonlocal dirty_detach_arrays, dirty_detach_bytes
+        if not dirty_detach_enabled_components:
+            return
+        if current_tokens is None:
+            current_tokens = len(tokens)
+        if current_tokens < dirty_detach_observed_tokens:
+            dirty_detach_observed_tokens = current_tokens
+            return
+        delta_tokens = current_tokens - dirty_detach_observed_tokens
+        if delta_tokens <= 0:
+            return
+        dirty_detach_observed_tokens = current_tokens
+        due_components: set[str] = set()
+        for component in dirty_detach_enabled_components:
+            dirty_detach_tokens_since[component] += delta_tokens
+            cadence = dirty_detach_cadences[component]
+            if cadence > 0 and dirty_detach_tokens_since[component] >= cadence:
+                due_components.add(component)
+                dirty_detach_tokens_since[component] = 0
+        if not due_components:
+            return
+        started_detach = time.perf_counter()
+        stats = detach_cache_state(
+            cache,
+            components=due_components,
+            mode=dirty_detach_mode,
+        )
+        dirty_detach_time_s += time.perf_counter() - started_detach
+        if int(stats.get("arrays", 0)) <= 0:
+            return
+        dirty_detach_events += 1
+        dirty_detach_arrays += int(stats.get("arrays", 0))
+        dirty_detach_bytes += int(stats.get("bytes", 0))
+
+    def capture_commit_detach_due(current_tokens: int) -> set[str]:
+        nonlocal capture_commit_detach_observed_tokens
+        if not capture_commit_detach_enabled_components:
+            return set()
+        if current_tokens < capture_commit_detach_observed_tokens:
+            capture_commit_detach_observed_tokens = current_tokens
+            return set()
+        delta_tokens = current_tokens - capture_commit_detach_observed_tokens
+        if delta_tokens <= 0:
+            return set()
+        capture_commit_detach_observed_tokens = current_tokens
+        due_components: set[str] = set()
+        for component in capture_commit_detach_enabled_components:
+            capture_commit_detach_tokens_since[component] += delta_tokens
+            cadence = capture_commit_detach_cadences[component]
+            if (
+                cadence > 0
+                and capture_commit_detach_tokens_since[component] >= cadence
+            ):
+                due_components.add(component)
+                capture_commit_detach_tokens_since[component] = 0
+        return due_components
+
+    def detach_capture_committed_state(current_tokens: int) -> None:
+        nonlocal capture_commit_detach_events, capture_commit_detach_time_s
+        nonlocal capture_commit_detach_arrays, capture_commit_detach_bytes
+        due_components = capture_commit_detach_due(current_tokens)
+        if not due_components:
+            return
+        started_detach = time.perf_counter()
+        stats = detach_cache_state(
+            cache,
+            components=due_components,
+            mode=capture_commit_detach_mode,
+        )
+        capture_commit_detach_time_s += time.perf_counter() - started_detach
+        if int(stats.get("arrays", 0)) <= 0:
+            return
+        capture_commit_detach_events += 1
+        capture_commit_detach_arrays += int(stats.get("arrays", 0))
+        capture_commit_detach_bytes += int(stats.get("bytes", 0))
+
+    def trace_totals() -> dict[str, Any]:
+        return {
+            "generated_tokens": len(tokens),
+            "accepted_drafts": accepted,
+            "rejected_drafts": rejected,
+            "drafted_tokens": drafted,
+            "verify_calls": verify_calls,
+            "correction_tokens": correction_tokens,
+            "bonus_tokens": bonus_tokens,
+            "verify_time_s": verify_time,
+            "verify_forward_time_s": verify_forward_time,
+            "verify_eval_time_s": verify_eval_time,
+            "verify_logits_eval_time_s": verify_logits_eval_time,
+            "verify_hidden_eval_time_s": verify_hidden_eval_time,
+            "verify_joint_eval_time_s": verify_joint_eval_time,
+            "verify_target_distribution_time_s": verify_target_distribution_time,
+            "verify_eval_unattributed_time_s": verify_eval_unattributed_time,
+            "draft_time_s": draft_time,
+            "accept_time_s": accept_time,
+            "repair_time_s": repair_time,
+            "commit_time_s": commit_time,
+            "capture_commit_time_s": capture_commit_time,
+            "snapshot_time_s": snapshot_time,
+            "bonus_time_s": bonus_time,
+            "verify_output_nbytes": trace_verify_output_nbytes,
+            "draft_output_nbytes": trace_draft_output_nbytes,
+            "mtp_history_append_nbytes": trace_mtp_history_append_nbytes,
+            "clear_cache_events": clear_cache_events,
+            "clear_cache_time_s": clear_cache_time_s,
+            "trunk_cache_materialize_events": trunk_cache_materialize_events,
+            "trunk_cache_materialize_time_s": trunk_cache_materialize_time_s,
+            "dirty_detach_events": dirty_detach_events,
+            "dirty_detach_time_s": dirty_detach_time_s,
+            "dirty_detach_arrays": dirty_detach_arrays,
+            "dirty_detach_bytes": dirty_detach_bytes,
+            "live_output_detach_events": live_output_detach_events,
+            "live_output_detach_time_s": live_output_detach_time_s,
+            "live_output_detach_arrays": live_output_detach_arrays,
+            "live_output_detach_bytes": live_output_detach_bytes,
+            "state_rebase_events": state_rebase_events,
+            "state_rebase_time_s": state_rebase_time_s,
+            "state_root_eval_events": state_root_eval_events,
+            "state_root_eval_time_s": state_root_eval_time_s,
+            "state_root_eval_arrays": state_root_eval_arrays,
+            "capture_commit_detach_events": capture_commit_detach_events,
+            "capture_commit_detach_time_s": capture_commit_detach_time_s,
+            "capture_commit_detach_arrays": capture_commit_detach_arrays,
+            "capture_commit_detach_bytes": capture_commit_detach_bytes,
+            "trace_accounting_time_s": trace_accounting_time_s,
+            "accepted_by_depth": list(accepted_by_depth),
+            "drafted_by_depth": list(drafted_by_depth),
+            "accept_probability_sum_by_depth": list(accept_probability_sum_by_depth),
+        }
+
+    def emit_trace(*, force: bool = False, final: bool = False) -> None:
+        trace.maybe_emit(
+            force=force,
+            final=final,
+            totals=trace_totals(),
+            cache=cache,
+            mtp_cache=trace_current_mtp_cache,
+            mtp_history_materialize_every=mtp_history_materialize_every,
+            mtp_history_materialize_events=mtp_history_materialize_events,
+        )
+
+    def emit_new_tokens() -> None:
+        nonlocal streamed_token_count
+        maybe_materialize_trunk_cache()
+        maybe_clear_mlx_cache()
+        if token_callback is None or streamed_token_count >= len(tokens):
+            return
+        new_tokens = [
+            int(token)
+            for token in tokens[streamed_token_count:]
+            if not _is_stop(int(token), stop_token_ids)
+        ]
+        streamed_token_count = len(tokens)
+        if new_tokens:
+            token_callback(new_tokens)
+
+    step = 0
+    while len(tokens) < max_tokens:
+        primary_already_emitted = pending_primary is not None
+        if pending_primary is None:
+            primary, _ = _sample_from_logits(logits[0], sampler, rng)
+            tokens.append(primary)
+            emit_new_tokens()
+        else:
+            primary = pending_primary
+            pending_primary = None
+        planned_depth = (
+            adaptive_policy.current_depth
+            if adaptive_policy is not None
+            else speculative_depth
+        )
+        if adaptive_policy is None and late_depth_switch_after > 0:
+            planned_depth = (
+                late_depth_after
+                if len(tokens) >= late_depth_switch_after
+                else late_depth_before
+            )
+            planned_depth = max(1, min(int(planned_depth), int(speculative_depth)))
+        event = {
+            "step": step,
+            "primary": primary,
+            "primary_already_emitted": primary_already_emitted,
+            "depth": planned_depth,
+            "requested_depth": requested_speculative_depth,
+            "drafts": [],
+            "accepted_depths": 0,
+            "rejected_at_depth": None,
+            "gated_stop_depth": None,
+            "mtp_history_policy": mtp_history_policy,
+            "verify_strategy": verify_strategy,
+            "verify_core": verify_core_backend.replace("_", "-"),
+            "draft_core": draft_core,
+        }
+        if late_depth_switch_after > 0:
+            event["late_depth_switch"] = {
+                "after_tokens": int(late_depth_switch_after),
+                "before": int(late_depth_before),
+                "after": int(late_depth_after),
+            }
+        if long_context_depth_policy.get("active"):
+            event["long_context_mtp_depth_policy"] = long_context_depth_policy
+        if mtp_position_mode not in {"", "0", "off", "false", "default", "cache"}:
+            event["mtp_position"] = {
+                "mode": mtp_position_mode,
+                "cap": int(mtp_position_cap),
+                "period": int(mtp_position_period),
+                "base": int(mtp_position_base),
+                "history_offset": _mtp_cache_offset(mtp_history_cache),
+            }
+        if online_hidden_enabled:
+            event["online_hidden_corrector"] = {
+                "alpha": float(online_hidden_corrector_alpha),
+                "decay": float(online_hidden_corrector_decay),
+                "warmup": int(online_hidden_corrector_warmup),
+                "max_feed_depth": int(online_hidden_max_feed_depth),
+                "key": online_hidden_corrector_key,
+            }
+        correction_cache_enabled = online_correction_cache or prompt_correction_cache
+        if correction_cache_enabled:
+            event["online_correction_cache"] = {
+                "enabled": bool(online_correction_cache),
+                "prompt_enabled": bool(prompt_correction_cache),
+                "min_depth": int(online_correction_cache_min_depth),
+                "prompt_min_depth": int(prompt_correction_cache_min_depth),
+                "key_policy": online_correction_cache_key,
+            }
+        if adapter_ensemble_q:
+            event["adapter_ensemble_q"] = {
+                "enabled": True,
+                "epsilon": float(adapter_ensemble_epsilon),
+                "min_depth": int(adapter_ensemble_min_depth),
+            }
+        if mtp_topk_reranker is not None:
+            event["mtp_topk_reranker"] = mtp_topk_reranker.to_dict()
+        step += 1
+        if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
+            append_event(event)
+            emit_trace()
+            break
+
+        cycle_depth = min(planned_depth, max_tokens - len(tokens))
+        draft_tokens: list[int] = []
+        draft_probs: list[np.ndarray | None] = []
+        draft_cache_keys: list[tuple[int, ...]] = []
+        draft_hidden_for_update: list[mx.array] = []
+        draft_hidden_update_keys: list[object] = []
+        if _mtp_history_uses_committed_cache(mtp_history_policy):
+            mtp_cache = mtp_history_cache
+            cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
+        else:
+            mtp_cache = rt.make_mtp_cache() if mtp_cache_policy == "persistent" else None
+            cycle_mtp_offset = None
+        trace_current_mtp_cache = mtp_cache if mtp_cache is not None else mtp_history_cache
+        draft_hidden = hidden
+        next_token = primary
+
+        used_device_d2_core = False
+        device_d2_eligible = (
+            draft_core == "device-d2"
+            and cycle_depth == 2
+            and speculative_depth == 2
+            and mtp_cache_policy == "persistent"
+            and mtp_history_policy == "cycle"
+            and draft_sampler.temperature <= 0
+            and draft_margin_threshold is None
+            and adaptive_policy is None
+            and mtp_corrector is None
+            and not online_hidden_enabled
+            and not online_correction_cache
+        )
+        if device_d2_eligible:
+            try:
+                if device_d2_core is None:
+                    compile_started = time.perf_counter()
+                    device_d2_core = _make_device_d2_draft_core(
+                        rt,
+                        draft_hidden,
+                        mx.array([[primary]]),
+                        mtp_hidden_variant=mtp_hidden_variant,
+                    )
+                    elapsed_compile = time.perf_counter() - compile_started
+                    device_d2_compile_time += elapsed_compile
+                    draft_time += elapsed_compile
+                    _add_timing(event, "draft_core_compile", elapsed_compile)
+                    event["draft_core_compile"] = {
+                        "kind": "device-d2",
+                        "mtp_cache_promoted": int(device_d2_core["promoted"]),
+                        "promotion_failures": dict(device_d2_core["promotion_failures"]),
+                    }
+                started = time.perf_counter()
+                draft_tokens = _run_device_d2_draft_core(
+                    device_d2_core,
+                    draft_hidden,
+                    int(primary),
+                )
+                elapsed_draft = time.perf_counter() - started
+                draft_time += elapsed_draft
+                device_d2_calls += 1
+                used_device_d2_core = True
+                for depth_index, draft_token in enumerate(draft_tokens):
+                    draft_probs.append(
+                        SparseDistribution.one_hot(
+                            draft_token,
+                            int(logits.shape[-1]),
+                        )
+                        if sampler.temperature > 0
+                        else None
+                    )
+                    drafted += 1
+                    drafted_by_depth[depth_index] += 1
+                    event["drafts"].append(
+                        {
+                            "depth": depth_index + 1,
+                            "token": int(draft_token),
+                            "timing_s": {
+                                "draft": elapsed_draft if depth_index == len(draft_tokens) - 1 else 0.0,
+                            },
+                            "mtp_corrector": None,
+                            "draft_core": "device-d2",
+                        }
+                    )
+                next_token = draft_tokens[-1]
+            except Exception as exc:
+                device_d2_fallbacks += 1
+                event["draft_core_error"] = repr(exc)
+                used_device_d2_core = False
+
+        if not used_device_d2_core:
+            if draft_core == "device-d2" and not device_d2_eligible:
+                device_d2_fallbacks += 1
+                event["draft_core_fallback"] = {
+                    "requested": "device-d2",
+                    "reason": "ineligible_contract",
+                }
+        for depth_index in range(0 if used_device_d2_core else cycle_depth):
+            source_token = int(next_token)
+            step_mtp_cache = mtp_cache if mtp_cache_policy == "persistent" else rt.make_mtp_cache()
+            draft_position_offset = mtp_position_offset_for_cache(step_mtp_cache)
+            started = time.perf_counter()
+            cache_depth = depth_index + 1
+            ensemble_info: dict[str, Any] | None = None
+            ensemble_base_logits = None
+            ensemble_adapter_logits = None
+            ensemble_base_hidden = None
+            ensemble_adapter_hidden = None
+            ensemble_eligible = (
+                adapter_ensemble_q
+                and rt.mtp_adapter_path is not None
+                and sampler.temperature > 0
+                and draft_sampler.temperature <= 0
+                and cache_depth >= adapter_ensemble_min_depth
+                and cache_depth == cycle_depth
+                and mtp_cache_policy == "persistent"
+                and mtp_history_policy == "cycle"
+                and step_mtp_cache is not None
+            )
+            if ensemble_eligible:
+                cache_offset = _mtp_cache_offset(step_mtp_cache)
+                base_result = rt.draft_mtp(
+                    draft_hidden,
+                    mx.array([[next_token]]),
+                    mtp_cache=step_mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_depth=0,
+                    position_offset=draft_position_offset,
+                )
+                ensemble_base_logits, ensemble_base_hidden = base_result
+                _eval(ensemble_base_logits, ensemble_base_hidden)
+                _rollback_mtp_cache(step_mtp_cache, cache_offset)
+                adapter_result = rt.draft_mtp(
+                    draft_hidden,
+                    mx.array([[next_token]]),
+                    mtp_cache=step_mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_depth=cache_depth,
+                    position_offset=draft_position_offset,
+                )
+                ensemble_adapter_logits, ensemble_adapter_hidden = adapter_result
+                draft_logits, draft_hidden_next = adapter_result
+            else:
+                if adapter_ensemble_q and cache_depth >= adapter_ensemble_min_depth:
+                    adapter_ensemble_fallbacks += 1
+                draft_result = rt.draft_mtp(
+                    draft_hidden,
+                    mx.array([[next_token]]),
+                    mtp_cache=step_mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_depth=cache_depth,
+                    position_offset=draft_position_offset,
+                )
+                draft_logits, draft_hidden_next = draft_result
+            wants_policy_metrics = bool(
+                getattr(adaptive_policy, "wants_draft_metrics", False)
+            )
+            draft_metrics = (
+                _draft_confidence_metrics(draft_logits[:, -1, :][0])
+                if draft_margin_threshold is not None or wants_policy_metrics
+                else {}
+            )
+            margin = draft_metrics.get("top2_margin")
+            if (
+                draft_margin_threshold is not None
+                and margin is not None
+                and margin < draft_margin_threshold
+                and depth_index >= min_speculative_depth
+            ):
+                event["gated_stop_depth"] = depth_index + 1
+                event["drafts"].append(
+                    {
+                        "depth": depth_index + 1,
+                        "top2_margin": margin,
+                        "speculation_skipped": True,
+                    }
+                )
+                draft_time += time.perf_counter() - started
+                break
+            cache_key = _online_correction_cache_key(
+                online_correction_cache_key,
+                depth=cache_depth,
+                primary=int(primary),
+                source_token=source_token,
+                draft_prefix=draft_tokens,
+            )
+            cache_enabled_for_depth = correction_cache_enabled and (
+                (
+                    online_correction_cache
+                    and cache_depth >= online_correction_cache_min_depth
+                )
+                or (
+                    prompt_correction_cache
+                    and cache_depth >= prompt_correction_cache_min_depth
+                )
+            )
+            reranker_info = None
+            cached_token = correction_cache.get(cache_key) if cache_enabled_for_depth else None
+            if cached_token is not None:
+                draft_token = int(cached_token)
+                draft_q = (
+                    SparseDistribution.one_hot(draft_token, int(draft_logits.shape[-1]))
+                    if sampler.temperature > 0
+                    else None
+                )
+                correction_cache_hits += 1
+                if cache_key in prompt_seeded_cache_keys:
+                    prompt_correction_cache_hits += 1
+            elif ensemble_eligible and ensemble_base_logits is not None and ensemble_adapter_logits is not None:
+                draft_token, draft_q, ensemble_info = _sample_adapter_ensemble_q(
+                    ensemble_base_logits[:, -1, :][0],
+                    ensemble_adapter_logits[:, -1, :][0],
+                    epsilon=adapter_ensemble_epsilon,
+                    rng=rng,
+                )
+                adapter_ensemble_calls += 1
+                if bool(ensemble_info["changed"]):
+                    adapter_ensemble_changed += 1
+                selected = str(ensemble_info["selected"])
+                if selected == "adapter":
+                    adapter_ensemble_adapter_selected += 1
+                    draft_hidden_next = ensemble_adapter_hidden
+                    draft_logits = ensemble_adapter_logits
+                elif selected == "base":
+                    adapter_ensemble_base_selected += 1
+                    draft_hidden_next = ensemble_base_hidden
+                    draft_logits = ensemble_base_logits
+                else:
+                    adapter_ensemble_shared_selected += 1
+                    draft_hidden_next = ensemble_adapter_hidden
+                    draft_logits = ensemble_adapter_logits
+            else:
+                if (
+                    mtp_topk_reranker is not None
+                    and sampler.temperature > 0
+                    and cache_depth in mtp_topk_reranker.depth_priors
+                ):
+                    reranked = mtp_topk_reranker.select(
+                        draft_logits[:, -1, :][0],
+                        depth=cache_depth,
+                    )
+                    if reranked is not None:
+                        draft_token, reranker_info = reranked
+                        draft_q = SparseDistribution.one_hot(
+                            draft_token,
+                            int(draft_logits.shape[-1]),
+                        )
+                        topk_reranker_calls += 1
+                        if bool(reranker_info["changed"]):
+                            topk_reranker_changed += 1
+                        topk_reranker_selected_rank_sum += int(reranker_info["selected_rank"])
+                    else:
+                        topk_reranker_fallbacks += 1
+                        draft_token, draft_q = _sample_draft_from_logits(
+                            draft_logits[:, -1, :][0],
+                            draft_sampler,
+                            rng,
+                            need_distribution=sampler.temperature > 0,
+                        )
+                else:
+                    draft_token, draft_q = _sample_draft_from_logits(
+                        draft_logits[:, -1, :][0],
+                        draft_sampler,
+                        rng,
+                        need_distribution=sampler.temperature > 0,
+                    )
+            elapsed_draft = time.perf_counter() - started
+            draft_time += elapsed_draft
+            if trace.enabled:
+                trace_accounting_started = time.perf_counter()
+                trace_draft_output_nbytes += _tree_nbytes(draft_logits) + _tree_nbytes(draft_hidden_next)
+                if ensemble_base_logits is not None and ensemble_base_logits is not draft_logits:
+                    trace_draft_output_nbytes += _tree_nbytes(ensemble_base_logits)
+                if ensemble_base_hidden is not None and ensemble_base_hidden is not draft_hidden_next:
+                    trace_draft_output_nbytes += _tree_nbytes(ensemble_base_hidden)
+                trace_accounting_time_s += time.perf_counter() - trace_accounting_started
+            draft_tokens.append(draft_token)
+            draft_probs.append(draft_q)
+            draft_cache_keys.append(cache_key)
+            draft_hidden_base = draft_hidden_next[:, -1:, :]
+            if mtp_corrector is not None:
+                draft_hidden_base = mtp_corrector.apply_mlx(
+                    draft_hidden_base,
+                    depth=depth_index + 1,
+                )
+            feed_depth = depth_index + 1
+            draft_hidden_for_update.append(draft_hidden_base)
+            online_key: object = (
+                (feed_depth, source_token)
+                if online_hidden_corrector_key == "token"
+                else feed_depth
+            )
+            draft_hidden_update_keys.append(online_key)
+            draft_hidden = draft_hidden_base
+            online_draft_event: dict[str, object] | None = None
+            if (
+                online_hidden_enabled
+                and feed_depth <= online_hidden_max_feed_depth
+                and feed_depth < cycle_depth
+            ):
+                started_online = time.perf_counter()
+                update_count = online_hidden_update_counts.get(online_key, 0)
+                delta = online_hidden_deltas.get(online_key)
+                if delta is not None and update_count >= online_hidden_corrector_warmup:
+                    draft_hidden = draft_hidden + (
+                        float(online_hidden_corrector_alpha)
+                        * delta.astype(draft_hidden.dtype)
+                    )
+                    online_hidden_apply_counts[online_key] = (
+                        online_hidden_apply_counts.get(online_key, 0) + 1
+                    )
+                    online_draft_event = {
+                        "feed_depth": feed_depth,
+                        "key": online_hidden_corrector_key,
+                        "source_token": source_token if online_hidden_corrector_key == "token" else None,
+                        "applied": True,
+                        "updates": update_count,
+                        "apply_count": online_hidden_apply_counts[online_key],
+                    }
+                else:
+                    online_draft_event = {
+                        "feed_depth": feed_depth,
+                        "key": online_hidden_corrector_key,
+                        "source_token": source_token if online_hidden_corrector_key == "token" else None,
+                        "applied": False,
+                        "updates": update_count,
+                    }
+                online_hidden_corrector_time += time.perf_counter() - started_online
+            next_token = draft_token
+            drafted += 1
+            drafted_by_depth[depth_index] += 1
+            draft_event = {
+                "depth": depth_index + 1,
+                "token": draft_token,
+                "timing_s": {"draft": elapsed_draft},
+                "mtp_corrector": getattr(mtp_corrector, "kind", None) if mtp_corrector is not None else None,
+                **draft_metrics,
+            }
+            if draft_position_offset is not None:
+                draft_event["position_offset"] = int(draft_position_offset)
+            if correction_cache_enabled:
+                draft_event["online_correction_cache"] = {
+                    "hit": cached_token is not None,
+                    "enabled_for_depth": cache_enabled_for_depth,
+                    "key_policy": online_correction_cache_key,
+                    "key": list(cache_key),
+                    "cached_token": int(cached_token) if cached_token is not None else None,
+                    "prompt_seeded": cache_key in prompt_seeded_cache_keys,
+                }
+            if ensemble_info is not None:
+                draft_event["adapter_ensemble_q"] = ensemble_info
+            if reranker_info is not None:
+                draft_event["mtp_topk_reranker"] = reranker_info
+            if online_draft_event is not None:
+                draft_event["online_hidden_corrector"] = online_draft_event
+            event["drafts"].append(draft_event)
+            if adaptive_policy is not None and hasattr(adaptive_policy, "should_continue_after_draft"):
+                policy_continue = adaptive_policy.should_continue_after_draft(
+                    drafted_depth=depth_index + 1,
+                    max_depth=cycle_depth,
+                    draft_metrics=event["drafts"][-1],
+                )
+                event["drafts"][-1]["policy_continue"] = policy_continue
+                if not bool(policy_continue.get("continue", True)):
+                    event["gated_stop_depth"] = depth_index + 1
+                    event["policy_stop"] = policy_continue
+                    break
+
+        before_verify = None
+        if os.environ.get("MTPLX_SKIP_VERIFY_SNAPSHOT"):
+            event["snapshot"] = "skipped_capture_commit_required"
+        else:
+            started = time.perf_counter()
+            before_verify = snapshot_untrimmable_cache(cache)
+            elapsed_snapshot = time.perf_counter() - started
+            snapshot_time += elapsed_snapshot
+            _add_timing(event, "snapshot", elapsed_snapshot)
+        verify_input = [primary] + draft_tokens
+        set_native_mlp_context(len(tokens))
+        started_forward = time.perf_counter()
+        captures = None
+        with attention_phase("decode_verify"):
+            if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
+                if graphbank is not None:
+                    verify_logits, verify_hidden, captures = graphbank.forward_ar_capture(
+                        mx.array([verify_input]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                else:
+                    verify_logits, verify_hidden, captures = rt.forward_ar_capture(
+                        mx.array([verify_input]),
+                        cache=cache,
+                        return_hidden=True,
+                        capture_backend=verify_core_backend,
+                    )
+            elif graphbank is not None:
+                verify_logits, verify_hidden = graphbank.forward_ar(
+                    mx.array([verify_input]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+            else:
+                verify_logits, verify_hidden = rt.forward_ar(
+                    mx.array([verify_input]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+        elapsed_verify_forward = time.perf_counter() - started_forward
+        verify_forward_time += elapsed_verify_forward
+        _add_timing(event, "verify_forward", elapsed_verify_forward)
+        target_distribution_batch = None
+        target_distributions = None
+        target_distribution_precomputed = False
+        elapsed_target_distribution_eval = 0.0
+        started_eval = time.perf_counter()
+        if (
+            defer_verify_hidden_eval
+            and sampler.temperature > 0
+            and (_batch_target_arrays_enabled() or _batch_target_distributions_enabled())
+        ):
+            target_distribution_logits = verify_logits[:, : len(draft_tokens) + 1, :]
+            started_distribution = time.perf_counter()
+            if _batch_target_arrays_enabled():
+                target_distribution_batch = _batched_distributions_from_mlx_logits(
+                    target_distribution_logits,
+                    sampler,
+                )
+            else:
+                target_distributions = _distributions_from_mlx_logits(
+                    target_distribution_logits,
+                    sampler,
+                )
+            elapsed_target_distribution_eval = time.perf_counter() - started_distribution
+            verify_eval_timings = {
+                "verify_logits_eval_time_s": elapsed_target_distribution_eval,
+                "verify_hidden_eval_time_s": 0.0,
+                "verify_joint_eval_time_s": 0.0,
+            }
+            verify_target_distribution_time += elapsed_target_distribution_eval
+            target_distribution_precomputed = True
+            event["defer_verify_hidden_eval"] = {
+                "mode": "target_distribution_first",
+                "verify_hidden_mode": verify_hidden_mode,
+                "batch_target_arrays": bool(_batch_target_arrays_enabled()),
+                "batch_target_distributions": bool(_batch_target_distributions_enabled()),
+                "rows": int(len(draft_tokens) + 1),
+            }
+        elif captures is not None:
+            verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden, captures)
+        else:
+            verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+        elapsed_verify_eval = time.perf_counter() - started_eval
+        eval_attributed = sum(float(value) for value in verify_eval_timings.values())
+        elapsed_verify_eval_unattributed = max(0.0, elapsed_verify_eval - eval_attributed)
+        verify_logits_eval_time += float(verify_eval_timings["verify_logits_eval_time_s"])
+        verify_hidden_eval_time += float(verify_eval_timings["verify_hidden_eval_time_s"])
+        verify_joint_eval_time += float(verify_eval_timings["verify_joint_eval_time_s"])
+        verify_eval_unattributed_time += elapsed_verify_eval_unattributed
+        verify_eval_time += elapsed_verify_eval
+        _add_timing(event, "verify_eval", elapsed_verify_eval)
+        _add_timing(
+            event,
+            "verify_eval_logits",
+            float(verify_eval_timings["verify_logits_eval_time_s"]),
+        )
+        _add_timing(
+            event,
+            "verify_eval_hidden",
+            float(verify_eval_timings["verify_hidden_eval_time_s"]),
+        )
+        _add_timing(
+            event,
+            "verify_eval_joint",
+            float(verify_eval_timings["verify_joint_eval_time_s"]),
+        )
+        _add_timing(event, "verify_target_distribution", elapsed_target_distribution_eval)
+        _add_timing(event, "verify_eval_unattributed", elapsed_verify_eval_unattributed)
+        elapsed_verify = elapsed_verify_forward + elapsed_verify_eval
+        verify_time += elapsed_verify
+        target_time += elapsed_verify
+        verify_calls += 1
+        if trace.enabled:
+            trace_accounting_started = time.perf_counter()
+            trace_verify_output_nbytes += (
+                _tree_nbytes(verify_logits)
+                + _tree_nbytes(verify_hidden)
+                + _tree_nbytes(captures)
+            )
+            trace_accounting_time_s += time.perf_counter() - trace_accounting_started
+        if graphbank is not None:
+            event["graphbank"] = graphbank.to_dict()
+
+        accepted_count = 0
+        rejection_correction: int | None = None
+        started_accept = time.perf_counter()
+        if sampler.temperature > 0 and not target_distribution_precomputed:
+            target_distribution_logits = verify_logits[:, : len(draft_tokens) + 1, :]
+            if _batch_target_arrays_enabled():
+                target_distribution_batch = _batched_distributions_from_mlx_logits(
+                    target_distribution_logits,
+                    sampler,
+                )
+            elif _batch_target_distributions_enabled():
+                target_distributions = _distributions_from_mlx_logits(
+                    target_distribution_logits,
+                    sampler,
+                )
+        for depth_index, draft_token in enumerate(draft_tokens):
+            target_logits_for_draft = verify_logits[:, depth_index, :]
+            target_p_for_cache = None
+            if sampler.temperature <= 0:
+                target_token = int(mx.argmax(target_logits_for_draft[0], axis=-1).item())
+                accepted_now = draft_token == target_token
+                accept_prob = 1.0 if accepted_now else 0.0
+                correction = target_token
+            elif target_distribution_batch is not None:
+                draft_q = draft_probs[depth_index]
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires draft distributions")
+                p = target_distribution_batch.probability(depth_index, draft_token)
+                q = (
+                    draft_q.probability(draft_token)
+                    if isinstance(draft_q, SparseDistribution)
+                    else float(draft_q[draft_token])
+                )
+                accept_prob = 1.0 if q <= 0 and p > 0 else (0.0 if q <= 0 else min(1.0, p / q))
+                accepted_now = float(rng.random()) <= accept_prob
+                target_p_for_cache = (
+                    target_distribution_batch.to_distribution(depth_index)
+                    if online_correction_cache
+                    and depth_index + 1 >= online_correction_cache_min_depth
+                    else None
+                )
+                correction = (
+                    draft_token
+                    if accepted_now
+                    else sample_from_distribution(
+                        residual_distribution(
+                            target_p_for_cache
+                            if target_p_for_cache is not None
+                            else target_distribution_batch.to_distribution(depth_index),
+                            draft_q,
+                        ),
+                        rng,
+                    )
+                )
+            else:
+                target_p = (
+                    target_distributions[depth_index]
+                    if target_distributions is not None
+                    else _distribution_from_mlx_logits(target_logits_for_draft[0], sampler)
+                )
+                draft_q = draft_probs[depth_index]
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires draft distributions")
+                accept_prob = compute_acceptance_probability(target_p, draft_q, draft_token)
+                accepted_now = float(rng.random()) <= accept_prob
+                target_p_for_cache = target_p
+                correction = (
+                    draft_token
+                    if accepted_now
+                    else sample_from_distribution(residual_distribution(target_p, draft_q), rng)
+                )
+
+            event["drafts"][depth_index]["accepted"] = accepted_now
+            event["drafts"][depth_index]["accept_probability"] = float(accept_prob)
+            event["drafts"][depth_index]["correction"] = int(correction)
+            accept_probability_sum_by_depth[depth_index] += float(accept_prob)
+
+            if accepted_now:
+                accepted += 1
+                accepted_count += 1
+                accepted_by_depth[depth_index] += 1
+                if _is_stop(draft_token, stop_token_ids):
+                    break
+                continue
+
+            rejected += 1
+            event["rejected_at_depth"] = depth_index + 1
+            if (
+                online_correction_cache
+                and depth_index + 1 >= online_correction_cache_min_depth
+                and depth_index < len(draft_cache_keys)
+            ):
+                cached_target = int(
+                    correction
+                    if sampler.temperature <= 0
+                    else _distribution_argmax(
+                        target_p_for_cache
+                        if target_p_for_cache is not None
+                        else target_distribution_batch.to_distribution(depth_index)
+                    )
+                )
+                correction_cache[draft_cache_keys[depth_index]] = cached_target
+                prompt_seeded_cache_keys.discard(draft_cache_keys[depth_index])
+                correction_cache_stores += 1
+                event["drafts"][depth_index]["online_correction_cache"]["stored_token"] = cached_target
+            if sampler.temperature > 0:
+                rejection_correction = int(correction)
+            break
+        elapsed_accept = time.perf_counter() - started_accept
+        accept_time += elapsed_accept
+        _add_timing(event, "accept", elapsed_accept)
+
+        event["accepted_depths"] = accepted_count
+        if adaptive_policy is not None:
+            event["policy"] = adaptive_policy.observe(
+                attempted_depth=max(1, len(draft_tokens)),
+                accepted_depths=accepted_count,
+            )
+
+        if online_hidden_enabled and draft_hidden_for_update:
+            started_online = time.perf_counter()
+            update_events = []
+            for feed_depth, predicted_hidden in enumerate(draft_hidden_for_update, start=1):
+                if feed_depth > online_hidden_max_feed_depth:
+                    continue
+                if feed_depth > int(verify_hidden.shape[1]):
+                    continue
+                if accepted_count < feed_depth - 1:
+                    continue
+                online_key = draft_hidden_update_keys[feed_depth - 1]
+                target_hidden = verify_hidden[:, feed_depth - 1 : feed_depth, :].astype(mx.float32)
+                residual = target_hidden - predicted_hidden.astype(mx.float32)
+                previous = online_hidden_deltas.get(online_key)
+                if previous is None:
+                    updated = residual
+                else:
+                    updated = (
+                        float(online_hidden_corrector_decay) * previous
+                        + (1.0 - float(online_hidden_corrector_decay)) * residual
+                    )
+                _eval(updated)
+                online_hidden_deltas[online_key] = updated
+                online_hidden_update_counts[online_key] = (
+                    online_hidden_update_counts.get(online_key, 0) + 1
+                )
+                update_events.append(
+                    {
+                        "feed_depth": feed_depth,
+                        "key": online_hidden_corrector_key,
+                        "source_token": (
+                            online_key[1]
+                            if online_hidden_corrector_key == "token"
+                            and isinstance(online_key, tuple)
+                            else None
+                        ),
+                        "updates": online_hidden_update_counts[online_key],
+                        "accepted_prefix_required": feed_depth - 1,
+                    }
+                )
+            elapsed_online = time.perf_counter() - started_online
+            online_hidden_corrector_time += elapsed_online
+            if update_events:
+                event["online_hidden_corrector_updates"] = update_events
+                _add_timing(event, "online_hidden_corrector_update", elapsed_online)
+
+        if accepted_count == len(draft_tokens):
+            committed = [primary] + draft_tokens
+            tokens.extend(draft_tokens)
+            if _mtp_history_uses_committed_cache(mtp_history_policy):
+                assert mtp_cache is not None and cycle_mtp_offset is not None
+                _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                draft_time += append_mtp_history(
+                    mtp_cache,
+                    verify_hidden[:, : max(0, len(committed) - 1), :],
+                    committed[1:],
+                )
+            logits, hidden = own_live_logits_hidden(
+                verify_logits[:, len(draft_tokens), :],
+                verify_hidden[:, -1:, :],
+            )
+            if any(_is_stop(token, stop_token_ids) for token in draft_tokens):
+                tokens = _truncate_after_first_stop(tokens, stop_token_ids)
+                detach_capture_committed_state(len(tokens))
+                maybe_detach_dirty_state(len(tokens))
+                maybe_eval_state_roots(event, len(tokens))
+                emit_new_tokens()
+                append_event(event)
+                break
+            detach_capture_committed_state(len(tokens))
+            maybe_detach_dirty_state(len(tokens))
+            maybe_rebase_decode_state(len(tokens))
+            emit_new_tokens()
+            if len(tokens) < max_tokens:
+                started_bonus = time.perf_counter()
+                if target_distribution_batch is not None:
+                    bonus = target_distribution_batch.sample(len(draft_tokens), rng)
+                elif target_distributions is not None and len(target_distributions) > len(draft_tokens):
+                    bonus = sample_from_distribution(
+                        target_distributions[len(draft_tokens)],
+                        rng,
+                    )
+                else:
+                    bonus, _ = _sample_from_logits(logits[0], sampler, rng)
+                elapsed_bonus = time.perf_counter() - started_bonus
+                bonus_time += elapsed_bonus
+                _add_timing(event, "bonus_sample", elapsed_bonus)
+                tokens.append(bonus)
+                pending_primary = bonus
+                bonus_tokens += 1
+                event["bonus_token"] = int(bonus)
+                emit_new_tokens()
+                if _is_stop(bonus, stop_token_ids):
+                    maybe_eval_state_roots(event, len(tokens))
+                    append_event(event)
+                    emit_trace()
+                    break
+            maybe_eval_state_roots(event, len(tokens))
+            append_event(event)
+            emit_trace()
+            continue
+
+        committed = [primary] + draft_tokens[:accepted_count]
+        if rejection_correction is not None:
+            committed.append(rejection_correction)
+            correction_tokens += 1
+        tokens.extend(committed[1:])
+
+        committed_prefix_len = 1 + accepted_count
+        committed_from_capture = False
+        cache_committed_token_count = len(tokens)
+        if rejection_correction is not None:
+            cache_committed_token_count = max(0, cache_committed_token_count - 1)
+        capture_commit_detach_components = capture_commit_detach_due(
+            cache_committed_token_count
+        )
+        if verify_strategy in {"capture_commit", "graphbank_capture_commit"} and captures is not None:
+            from .gdn_capture import commit_captured_prefix
+
+            started_commit = time.perf_counter()
+            commit_detach_stats = {"arrays": 0, "bytes": 0}
+            committed_from_capture = commit_captured_prefix(
+                cache,
+                captures,
+                keep_tokens=committed_prefix_len,
+                verified_tokens=len(verify_input),
+                detach_components=capture_commit_detach_components,
+                detach_mode=capture_commit_detach_mode,
+                detach_stats=commit_detach_stats,
+            )
+            elapsed_commit = time.perf_counter() - started_commit
+            capture_commit_time += elapsed_commit
+            if int(commit_detach_stats.get("arrays", 0)) > 0:
+                capture_commit_detach_events += 1
+                capture_commit_detach_time_s += elapsed_commit
+                capture_commit_detach_arrays += int(commit_detach_stats["arrays"])
+                capture_commit_detach_bytes += int(commit_detach_stats["bytes"])
+            _add_timing(event, "capture_commit", elapsed_commit)
+
+        if committed_from_capture:
+            event["capture_repair"] = "captured_prefix_commit"
+            if rejection_correction is None:
+                repair_logits, repair_hidden = own_live_logits_hidden(
+                    verify_logits[:, committed_prefix_len - 1 : committed_prefix_len, :],
+                    verify_hidden[:, committed_prefix_len - 1 : committed_prefix_len, :],
+                )
+            else:
+                repair_logits, repair_hidden = own_live_logits_hidden(
+                    verify_logits[:, committed_prefix_len - 1 : committed_prefix_len, :],
+                    verify_hidden[:, committed_prefix_len - 1 : committed_prefix_len, :],
+                )
+                pending_primary = int(rejection_correction)
+                deferred_correction_repairs += 1
+                event["capture_repair"] = "captured_prefix_pending_correction"
+                event["pending_primary"] = int(rejection_correction)
+        else:
+            if before_verify is None:
+                raise RuntimeError(
+                    "capture commit failed after MTPLX_SKIP_VERIFY_SNAPSHOT=1"
+                )
+            event["capture_repair"] = "standard_reforward" if verify_strategy == "capture_commit" else None
+            started_rollback = time.perf_counter()
+            rollback_after_verify(cache, before_verify, verified_tokens=len(verify_input))
+            elapsed_rollback = time.perf_counter() - started_rollback
+            rollback_time += elapsed_rollback
+            _add_timing(event, "rollback", elapsed_rollback)
+            started = time.perf_counter()
+            with attention_phase("decode_verify"):
+                repair_logits, repair_hidden = rt.forward_ar(
+                    mx.array([committed]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+            _eval(repair_logits, repair_hidden)
+            elapsed_repair = time.perf_counter() - started
+            target_time += elapsed_repair
+            repair_time += elapsed_repair
+            _add_timing(event, "repair_forward", elapsed_repair)
+        if _mtp_history_uses_committed_cache(mtp_history_policy):
+            assert mtp_cache is not None and cycle_mtp_offset is not None
+            _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+            history_tokens = committed[1:]
+            history_hidden = (
+                verify_hidden[:, : max(0, len(committed) - 1), :]
+                if committed_from_capture
+                else repair_hidden[:, : max(0, len(committed) - 1), :]
+            )
+            if committed_from_capture and rejection_correction is not None:
+                history_tokens = history_tokens[:-1]
+                history_hidden = verify_hidden[:, : max(0, committed_prefix_len - 1), :]
+            draft_time += append_mtp_history(
+                mtp_cache,
+                history_hidden,
+                history_tokens,
+            )
+        maybe_detach_dirty_state(cache_committed_token_count)
+        logits, hidden = own_live_logits_hidden(
+            repair_logits[:, -1, :],
+            repair_hidden[:, -1:, :],
+        )
+        maybe_rebase_decode_state(cache_committed_token_count)
+        maybe_eval_state_roots(event, cache_committed_token_count)
+        append_event(event)
+
+        if any(_is_stop(token, stop_token_ids) for token in committed):
+            stop_index = next(i for i, token in enumerate(tokens) if _is_stop(token, stop_token_ids))
+            tokens = tokens[: stop_index + 1]
+            emit_new_tokens()
+            emit_trace()
+            break
+        emit_new_tokens()
+        emit_trace()
+
+    final_state: GenerationFinalState | None = None
+    if capture_final_state and pending_primary is not None and tokens:
+        pending_token = int(pending_primary)
+        if (
+            _mtp_history_uses_committed_cache(mtp_history_policy)
+            and mtp_history_cache is not None
+            and hidden is not None
+        ):
+            commit_started = time.perf_counter()
+            draft_time += append_mtp_history(
+                mtp_history_cache,
+                hidden,
+                [pending_token],
+            )
+            commit_time += time.perf_counter() - commit_started
+        commit_started = time.perf_counter()
+        with attention_phase("decode_verify"):
+            commit_logits, commit_hidden = rt.forward_ar(
+                mx.array([[pending_token]]),
+                cache=cache,
+                return_hidden=True,
+            )
+        _eval(commit_logits, commit_hidden)
+        elapsed_commit_forward = time.perf_counter() - commit_started
+        target_time += elapsed_commit_forward
+        commit_time += elapsed_commit_forward
+        logits, hidden = own_live_logits_hidden(
+            commit_logits[:, -1, :],
+            commit_hidden[:, -1:, :],
+        )
+        pending_primary = None
+        detach_capture_committed_state(len(tokens))
+        maybe_detach_dirty_state(len(tokens))
+        maybe_rebase_decode_state(len(tokens))
+        maybe_eval_state_roots({"final_pending_commit": True}, len(tokens))
+
+    emit_trace(force=True, final=True)
+    elapsed = time.perf_counter() - started_all
+    finish_reason = (
+        "stop"
+        if any(_is_stop(token, stop_token_ids) for token in tokens)
+        else "length"
+    )
+    if capture_final_state:
+        final_state = GenerationFinalState(
+            final_trunk_cache=cache,
+            final_logits=logits,
+            final_hidden=hidden,
+            final_committed_mtp_cache=mtp_history_cache,
+            generated_token_ids=tuple(int(token) for token in tokens),
+            safe_to_commit=pending_primary is None,
+            finish_reason=finish_reason,
+            mtp_history_policy=mtp_history_policy,
+            mtp_history_window_tokens=int(prompt_state.mtp_history_window_tokens),
+            mtp_history_position_base=int(prompt_state.mtp_history_position_base),
+        )
+    reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
+    stats = GenerationStats(
+        mode="mtpk",
+        generated_tokens=len(tokens),
+        elapsed_s=elapsed,
+        tok_s=len(tokens) / elapsed if elapsed else 0.0,
+        accepted_drafts=accepted,
+        rejected_drafts=rejected,
+        drafted_tokens=drafted,
+        verify_time_s=verify_time,
+        verify_forward_time_s=verify_forward_time,
+        verify_eval_time_s=verify_eval_time,
+        verify_logits_eval_time_s=verify_logits_eval_time,
+        verify_hidden_eval_time_s=verify_hidden_eval_time,
+        verify_joint_eval_time_s=verify_joint_eval_time,
+        verify_target_distribution_time_s=verify_target_distribution_time,
+        verify_eval_unattributed_time_s=verify_eval_unattributed_time,
+        verify_hidden_mode=verify_hidden_mode,
+        draft_time_s=draft_time,
+        target_forward_time_s=target_time,
+        prompt_eval_time_s=prompt_eval_time,
+        prompt_tps=(
+            prompt_state.suffix_tokens / prompt_eval_time
+            if prompt_eval_time > 0
+            else 0.0
+        ),
+        prompt_target_prefill_time_s=prompt_target_prefill_time,
+        prompt_mtp_history_time_s=prompt_state.prompt_mtp_history_time_s,
+        prompt_target_prefill_tok_s=(
+            prompt_state.suffix_tokens / prompt_target_prefill_time
+            if prompt_target_prefill_time > 0
+            else 0.0
+        ),
+        prompt_mtp_history_tok_s=(
+            prompt_state.suffix_tokens / prompt_state.prompt_mtp_history_time_s
+            if prompt_state.prompt_mtp_history_time_s > 0
+            else 0.0
+        ),
+        mtp_history_policy=mtp_history_policy,
+        mtp_history_window_tokens=int(prompt_state.mtp_history_window_tokens),
+        mtp_history_position_base=int(prompt_state.mtp_history_position_base),
+        cached_tokens=prompt_state.cached_tokens,
+        new_prefill_tokens=prompt_state.suffix_tokens,
+        session_cache_hit=prompt_state.cache_hit,
+        cache_miss_reason=prompt_state.cache_miss_reason,
+        session_restore_mode=prompt_state.restore_mode,
+        session_prompt_prefix_bank_commit=prompt_prefix_bank_commit,
+        snapshot_time_s=snapshot_time,
+        accept_time_s=accept_time,
+        rollback_time_s=rollback_time,
+        repair_time_s=repair_time,
+        commit_time_s=commit_time,
+        capture_commit_time_s=capture_commit_time,
+        mtp_history_materialize_every=mtp_history_materialize_every,
+        mtp_history_materialize_events=mtp_history_materialize_events,
+        clear_cache_every=clear_cache_every,
+        clear_cache_events=clear_cache_events,
+        clear_cache_time_s=clear_cache_time_s,
+        trunk_cache_materialize_every=trunk_cache_materialize_every,
+        trunk_cache_materialize_events=trunk_cache_materialize_events,
+        trunk_cache_materialize_time_s=trunk_cache_materialize_time_s,
+        dirty_detach_components=dirty_detach_enabled_components,
+        dirty_detach_mode=dirty_detach_mode,
+        dirty_detach_gdn_every=dirty_detach_cadences["gdn"],
+        dirty_detach_conv_every=dirty_detach_cadences["conv"],
+        dirty_detach_attn_every=dirty_detach_cadences["attn"],
+        dirty_detach_events=dirty_detach_events,
+        dirty_detach_time_s=dirty_detach_time_s,
+        dirty_detach_arrays=dirty_detach_arrays,
+        dirty_detach_bytes=dirty_detach_bytes,
+        live_output_detach_enabled=live_output_detach_enabled,
+        live_output_detach_mode=live_output_detach_mode,
+        live_output_detach_events=live_output_detach_events,
+        live_output_detach_time_s=live_output_detach_time_s,
+        live_output_detach_arrays=live_output_detach_arrays,
+        live_output_detach_bytes=live_output_detach_bytes,
+        state_rebase_every=state_rebase_every,
+        state_rebase_events=state_rebase_events,
+        state_rebase_time_s=state_rebase_time_s,
+        state_root_eval_enabled=state_root_eval_enabled,
+        state_root_eval_include_mtp=state_root_eval_include_mtp,
+        state_root_eval_events=state_root_eval_events,
+        state_root_eval_time_s=state_root_eval_time_s,
+        state_root_eval_arrays=state_root_eval_arrays,
+        capture_commit_detach_components=capture_commit_detach_enabled_components,
+        capture_commit_detach_mode=capture_commit_detach_mode,
+        capture_commit_detach_gdn_every=capture_commit_detach_cadences["gdn"],
+        capture_commit_detach_conv_every=capture_commit_detach_cadences["conv"],
+        capture_commit_detach_events=capture_commit_detach_events,
+        capture_commit_detach_time_s=capture_commit_detach_time_s,
+        capture_commit_detach_arrays=capture_commit_detach_arrays,
+        capture_commit_detach_bytes=capture_commit_detach_bytes,
+        trace_accounting_time_s=trace_accounting_time_s,
+        decode_trace_path=str(trace.path) if trace.path is not None else None,
+        decode_trace_run_id=trace.run_id if trace.enabled else None,
+        bonus_time_s=bonus_time,
+        online_hidden_corrector_time_s=online_hidden_corrector_time,
+        peak_memory_bytes=mx.get_peak_memory(),
+        speculative_depth=speculative_depth,
+        requested_speculative_depth=requested_speculative_depth,
+        long_context_mtp_depth_policy=long_context_depth_policy,
+        accepted_by_depth=accepted_by_depth,
+        drafted_by_depth=drafted_by_depth,
+        accept_probability_sum_by_depth=accept_probability_sum_by_depth,
+        mean_accept_probability_by_depth=_mean_accept_probability_by_depth(
+            accept_probability_sum_by_depth,
+            drafted_by_depth,
+        ),
+        bonus_tokens=bonus_tokens,
+        correction_tokens=correction_tokens,
+        verify_calls=verify_calls,
+        graphbank=graphbank.to_dict() if graphbank is not None else {},
+        reject_path_counts=reject_path_counts,
+        repair_time_by_reject_depth_s=repair_time_by_reject_depth,
+        deferred_correction_repairs=deferred_correction_repairs,
+        online_correction_cache={
+            "enabled": online_correction_cache,
+            "prompt_enabled": prompt_correction_cache,
+            "hits": correction_cache_hits,
+            "stores": correction_cache_stores,
+            "entries": len(correction_cache),
+            "key_policy": online_correction_cache_key,
+            "prompt_hits": prompt_correction_cache_hits,
+            "prompt_stores": int(prompt_seed_stats.get("stores", 0)),
+            "prompt_collisions": int(prompt_seed_stats.get("collisions", 0)),
+            "prompt_skipped": int(prompt_seed_stats.get("skipped", 0)),
+            "prompt_min_depth": prompt_correction_cache_min_depth,
+        },
+        adapter_ensemble_q={
+            "enabled": adapter_ensemble_q,
+            "epsilon": float(adapter_ensemble_epsilon),
+            "min_depth": int(adapter_ensemble_min_depth),
+            "calls": adapter_ensemble_calls,
+            "changed": adapter_ensemble_changed,
+            "base_selected": adapter_ensemble_base_selected,
+            "adapter_selected": adapter_ensemble_adapter_selected,
+            "shared_selected": adapter_ensemble_shared_selected,
+            "fallbacks": adapter_ensemble_fallbacks,
+        },
+        mtp_topk_reranker={
+            "enabled": mtp_topk_reranker is not None,
+            "calls": topk_reranker_calls,
+            "changed": topk_reranker_changed,
+            "fallbacks": topk_reranker_fallbacks,
+            "selected_rank_sum": topk_reranker_selected_rank_sum,
+            "mean_selected_rank": (
+                topk_reranker_selected_rank_sum / topk_reranker_calls
+                if topk_reranker_calls
+                else None
+            ),
+            **(
+                mtp_topk_reranker.to_dict()
+                if mtp_topk_reranker is not None
+                else {}
+            ),
+        },
+        draft_core={
+            "requested": draft_core,
+            "device_d2_calls": device_d2_calls,
+            "device_d2_fallbacks": device_d2_fallbacks,
+            "device_d2_compile_time_s": device_d2_compile_time,
+        },
+        owned_recurrent_state=owned_recurrent_state_stats(cache),
+        owned_attn_kv=tail_owned_attention_kv_stats(cache),
+        events=events,
+    )
+    _attach_runtime_diagnostics(stats, rt, counter_start)
+    return GenerationOutput(
+        tokens=tokens,
+        text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
+        stats=stats,
+        final_state=final_state,
+    )
+
+
+def generate_mtpa(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    sampler: SamplerConfig,
+    max_depth: int,
+    seed: int = 0,
+    stop_token_ids: set[int] | None = None,
+    mtp_hidden_variant: str = "post_norm",
+    mtp_cache_policy: str = "persistent",
+    draft_sampler: SamplerConfig | None = None,
+    min_depth: int = 1,
+    start_depth: int = 1,
+    increase_after: int = 4,
+    decrease_after: int = 1,
+) -> GenerationOutput:
+    """Generate with a simple adaptive native-MTP depth policy."""
+    if not rt.mtp_enabled:
+        raise RuntimeError("generate_mtpa requires an MTP-enabled runtime")
+    if max_depth < 1:
+        raise ValueError("max_depth must be >= 1")
+    if mtp_cache_policy not in {"persistent", "fresh"}:
+        raise ValueError("mtp_cache_policy must be 'persistent' or 'fresh'")
+
+    counter_start = _runtime_counter_snapshot(rt)
+    rng = np.random.default_rng(seed)
+    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
+    policy = AdaptiveDepthPolicy(
+        max_depth=max_depth,
+        min_depth=min_depth,
+        start_depth=start_depth,
+        increase_after=increase_after,
+        decrease_after=decrease_after,
+    )
+    stop_token_ids = _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
+    started_all = time.perf_counter()
+    cache, logits, hidden, target_time = _prefill(rt, prompt_ids, return_hidden=True)
+    tokens: list[int] = []
+    events: list[dict] = []
+    accepted = rejected = drafted = 0
+    accepted_by_depth = [0 for _ in range(max_depth)]
+    drafted_by_depth = [0 for _ in range(max_depth)]
+    accept_probability_sum_by_depth = [0.0 for _ in range(max_depth)]
+    draft_time = verify_time = 0.0
+    snapshot_time = accept_time = rollback_time = repair_time = 0.0
+
+    step = 0
+    while len(tokens) < max_tokens:
+        primary, _ = _sample_from_logits(logits[0], sampler, rng)
+        planned_depth = policy.current_depth
+        event = {
+            "step": step,
+            "primary": primary,
+            "depth": planned_depth,
+            "max_depth": max_depth,
+            "drafts": [],
+            "accepted_depths": 0,
+            "rejected_at_depth": None,
+        }
+        step += 1
+        tokens.append(primary)
+        if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
+            events.append(event)
+            break
+
+        cycle_depth = min(planned_depth, max_tokens - len(tokens))
+        draft_tokens: list[int] = []
+        draft_probs: list[np.ndarray | SparseDistribution | None] = []
+        mtp_cache = rt.make_mtp_cache() if mtp_cache_policy == "persistent" else None
+        draft_hidden = hidden
+        next_token = primary
+
+        for depth_index in range(cycle_depth):
+            step_mtp_cache = mtp_cache if mtp_cache_policy == "persistent" else rt.make_mtp_cache()
+            started = time.perf_counter()
+            draft_logits, draft_hidden_next = rt.draft_mtp(
+                draft_hidden,
+                mx.array([[next_token]]),
+                mtp_cache=step_mtp_cache,
+                return_hidden=True,
+                mtp_hidden_variant=mtp_hidden_variant,
+            )
+            draft_token, draft_q = _sample_draft_from_logits(
+                draft_logits[:, -1, :][0],
+                draft_sampler,
+                rng,
+                need_distribution=sampler.temperature > 0,
+            )
+            elapsed_draft = time.perf_counter() - started
+            draft_time += elapsed_draft
+            draft_tokens.append(draft_token)
+            draft_probs.append(draft_q)
+            draft_hidden = draft_hidden_next[:, -1:, :]
+            next_token = draft_token
+            drafted += 1
+            drafted_by_depth[depth_index] += 1
+            event["drafts"].append(
+                {
+                    "depth": depth_index + 1,
+                    "token": draft_token,
+                    "timing_s": {"draft": elapsed_draft},
+                }
+            )
+
+        started = time.perf_counter()
+        before_verify = snapshot_untrimmable_cache(cache)
+        elapsed_snapshot = time.perf_counter() - started
+        snapshot_time += elapsed_snapshot
+        _add_timing(event, "snapshot", elapsed_snapshot)
+        verify_input = [primary] + draft_tokens
+        started = time.perf_counter()
+        with attention_phase("decode_verify"):
+            verify_logits, verify_hidden = rt.forward_ar(
+                mx.array([verify_input]),
+                cache=cache,
+                return_hidden=True,
+            )
+        _eval(verify_logits, verify_hidden)
+        elapsed_verify = time.perf_counter() - started
+        verify_time += elapsed_verify
+        target_time += elapsed_verify
+
+        accepted_count = 0
+        rejection_correction: int | None = None
+        started_accept = time.perf_counter()
+        for depth_index, draft_token in enumerate(draft_tokens):
+            target_logits_for_draft = verify_logits[:, depth_index, :]
+            if sampler.temperature <= 0:
+                target_token = int(mx.argmax(target_logits_for_draft[0], axis=-1).item())
+                accepted_now = draft_token == target_token
+                accept_prob = 1.0 if accepted_now else 0.0
+                correction = target_token
+            else:
+                target_p = _distribution_from_mlx_logits(target_logits_for_draft[0], sampler)
+                draft_q = draft_probs[depth_index]
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires draft distributions")
+                accept_prob = compute_acceptance_probability(target_p, draft_q, draft_token)
+                accepted_now = float(rng.random()) <= accept_prob
+                correction = (
+                    draft_token
+                    if accepted_now
+                    else sample_from_distribution(residual_distribution(target_p, draft_q), rng)
+                )
+
+            event["drafts"][depth_index]["accepted"] = accepted_now
+            event["drafts"][depth_index]["accept_probability"] = float(accept_prob)
+            event["drafts"][depth_index]["correction"] = int(correction)
+            accept_probability_sum_by_depth[depth_index] += float(accept_prob)
+
+            if accepted_now:
+                accepted += 1
+                accepted_count += 1
+                accepted_by_depth[depth_index] += 1
+                if _is_stop(draft_token, stop_token_ids):
+                    break
+                continue
+
+            rejected += 1
+            event["rejected_at_depth"] = depth_index + 1
+            if sampler.temperature > 0:
+                rejection_correction = int(correction)
+            break
+        elapsed_accept = time.perf_counter() - started_accept
+        accept_time += elapsed_accept
+        _add_timing(event, "accept", elapsed_accept)
+
+        event["accepted_depths"] = accepted_count
+        event["policy"] = policy.observe(
+            attempted_depth=cycle_depth,
+            accepted_depths=accepted_count,
+        )
+
+        if accepted_count == len(draft_tokens):
+            tokens.extend(draft_tokens)
+            logits = verify_logits[:, len(draft_tokens), :]
+            hidden = verify_hidden[:, -1:, :]
+            events.append(event)
+            if any(_is_stop(token, stop_token_ids) for token in draft_tokens):
+                tokens = _truncate_after_first_stop(tokens, stop_token_ids)
+                break
+            continue
+
+        committed = [primary] + draft_tokens[:accepted_count]
+        if rejection_correction is not None:
+            committed.append(rejection_correction)
+        tokens.extend(committed[1:])
+
+        started_rollback = time.perf_counter()
+        rollback_after_verify(cache, before_verify, verified_tokens=len(verify_input))
+        elapsed_rollback = time.perf_counter() - started_rollback
+        rollback_time += elapsed_rollback
+        _add_timing(event, "rollback", elapsed_rollback)
+        started = time.perf_counter()
+        with attention_phase("decode_verify"):
+            repair_logits, repair_hidden = rt.forward_ar(
+                mx.array([committed]),
+                cache=cache,
+                return_hidden=True,
+            )
+        _eval(repair_logits, repair_hidden)
+        elapsed_repair = time.perf_counter() - started
+        target_time += elapsed_repair
+        repair_time += elapsed_repair
+        _add_timing(event, "repair_forward", elapsed_repair)
+        logits = repair_logits[:, -1, :]
+        hidden = repair_hidden[:, -1:, :]
+        events.append(event)
+
+        if any(_is_stop(token, stop_token_ids) for token in committed):
+            stop_index = next(i for i, token in enumerate(tokens) if _is_stop(token, stop_token_ids))
+            tokens = tokens[: stop_index + 1]
+            break
+
+    elapsed = time.perf_counter() - started_all
+    stats = GenerationStats(
+        mode="mtpa",
+        generated_tokens=len(tokens),
+        elapsed_s=elapsed,
+        tok_s=len(tokens) / elapsed if elapsed else 0.0,
+        accepted_drafts=accepted,
+        rejected_drafts=rejected,
+        drafted_tokens=drafted,
+        verify_time_s=verify_time,
+        draft_time_s=draft_time,
+        target_forward_time_s=target_time,
+        snapshot_time_s=snapshot_time,
+        accept_time_s=accept_time,
+        rollback_time_s=rollback_time,
+        repair_time_s=repair_time,
+        peak_memory_bytes=mx.get_peak_memory(),
+        speculative_depth=max_depth,
+        accepted_by_depth=accepted_by_depth,
+        drafted_by_depth=drafted_by_depth,
+        accept_probability_sum_by_depth=accept_probability_sum_by_depth,
+        mean_accept_probability_by_depth=_mean_accept_probability_by_depth(
+            accept_probability_sum_by_depth,
+            drafted_by_depth,
+        ),
+        events=events,
+    )
+    _attach_runtime_diagnostics(stats, rt, counter_start)
+    return GenerationOutput(
+        tokens=tokens,
+        text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
+        stats=stats,
+    )

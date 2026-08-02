@@ -1,0 +1,147 @@
+{# Sidebar: nav + live status + integration token shortcut + sign out.
+   Status panel polls /api/status every 5s via Alpine.js. #}
+
+<div class="side-group">
+  <div class="side-label">Workflows</div>
+  <nav class="side-nav">
+    <a href="{{ url_for('chat.chat_page') }}" class="{% if section == 'chat' %}is-active{% endif %}">Chat</a>
+    <a href="{{ url_for('arena.arena_page') }}" class="{% if section == 'arena' %}is-active{% endif %}">Arena</a>
+    <a href="{{ url_for('hub.hub_page') }}" class="{% if section == 'hub' %}is-active{% endif %}">Hub</a>
+    <a href="{{ url_for('quantize.quantize_page') }}" class="{% if section == 'quantize' %}is-active{% endif %}">Quantize</a>
+    <a href="{{ url_for('finetune.finetune_page') }}" class="{% if section == 'finetune' %}is-active{% endif %}">Fine-tune</a>
+    <a href="{{ url_for('dataset.dataset_page') }}" class="{% if section == 'dataset' %}is-active{% endif %}">Build dataset</a>
+  </nav>
+</div>
+
+<div class="side-group">
+  <div class="side-label">Settings</div>
+  <nav class="side-nav">
+    <a href="{{ url_for('settings.server') }}" class="{% if section == 'settings_server' %}is-active{% endif %}">Server</a>
+    <a href="{{ url_for('cluster.cluster_page') }}" class="{% if section == 'cluster' %}is-active{% endif %}">Cluster</a>
+    <a href="{{ url_for('integrations') }}" class="{% if section == 'integrations' %}is-active{% endif %}">Integrations</a>
+    <a href="{{ url_for('settings.hf_index') }}" class="{% if section == 'settings_hf' %}is-active{% endif %}">Hugging Face</a>
+    <a href="{{ url_for('settings.account') }}" class="{% if section == 'settings_account' %}is-active{% endif %}">Account</a>
+  </nav>
+</div>
+
+<div class="side-group"
+     x-data="sidebarStatus()"
+     x-init="poll()">
+  <div class="side-label">Status</div>
+  <div class="side-status">
+    <div class="row">
+      <span class="k">API</span>
+      <span class="v">
+        <template x-if="status.api_reachable"><span class="pill pill-ok" x-text="'port ' + status.api_port"></span></template>
+        <template x-if="!status.api_reachable"><span class="pill pill-idle" x-text="'port ' + status.api_port"></span></template>
+      </span>
+    </div>
+    <div class="row">
+      <span class="k">Model</span>
+      <span class="v" x-text="status.model ? shortModel(status.model) : '—'"></span>
+    </div>
+    <div class="row">
+      <span class="k">MTP</span>
+      <span class="v">
+        <template x-if="status.mtp_enabled"><span class="pill pill-ok" x-text="'depth ' + status.mtp_depth"></span></template>
+        <template x-if="!status.mtp_enabled"><span class="pill pill-idle">off</span></template>
+      </span>
+    </div>
+  </div>
+
+  <div class="copy-row" title="API base URL. Paste into Claude Code, Codex, etc.">
+    <code x-text="status.api_url + '/v1'"></code>
+    <button class="copy-btn" @click="copy(status.api_url + '/v1', $event)">⧉</button>
+  </div>
+  <div class="copy-row" title="Bearer token">
+    <code x-text="status.auth_token"></code>
+    <button class="copy-btn" @click="copy(status.auth_token, $event)">⧉</button>
+  </div>
+</div>
+
+<div class="side-group" x-data="recentJobs()" x-init="poll()">
+  <div class="side-label">Recent jobs</div>
+  <template x-if="jobs.length === 0">
+    <div style="font-size: 12px; color: var(--mute);">No jobs yet.</div>
+  </template>
+  <template x-for="job in jobs.slice(0,5)" :key="job.id">
+    <div class="side-status" style="margin-bottom: 4px; padding: 6px 8px;">
+      <div class="row">
+        <span class="k" x-text="job.kind"></span>
+        <span class="v">
+          <span class="pill"
+                :class="{'pill-ok': job.status === 'done',
+                         'pill-err': job.status === 'failed',
+                         'pill-running': job.status === 'running',
+                         'pill-warn': job.status === 'zombie',
+                         'pill-idle': job.status === 'queued'}"
+                x-text="job.status"></span>
+        </span>
+      </div>
+    </div>
+  </template>
+</div>
+
+<div class="side-group" style="margin-top: 22px;">
+  <div class="side-label">Learn</div>
+  <nav class="side-nav">
+    <a href="https://mlx-optiq.com/docs/" target="_blank" rel="noopener">Docs &amp; guides&nbsp;&#8599;</a>
+    <a href="https://mlx-optiq.com/changelog" target="_blank" rel="noopener">What's new&nbsp;&#8599;</a>
+  </nav>
+</div>
+
+<form method="post" action="{{ url_for('auth.logout') }}" style="margin-top: 18px;">
+  <button type="submit" class="btn btn-ghost" style="width: 100%;">Sign out</button>
+</form>
+
+<script>
+function sidebarStatus() {
+  return {
+    status: { api_url: '{{ api_url }}', api_port: '{{ api_url.split(":")[-1] }}', api_reachable: false, model: null, mtp_enabled: false, mtp_depth: 0, auth_token: 'sk-optiq-local' },
+    async poll() {
+      try {
+        const r = await fetch('/api/status', { credentials: 'same-origin' });
+        if (r.ok) this.status = await r.json();
+      } catch (e) {}
+      setTimeout(() => this.poll(), 5000);
+    },
+    shortModel(m) {
+      if (!m) return '—';
+      // Local path: /…/Qwen_Qwen3.5-0.8B-bpw4.5/optiq_mixed → Qwen3.5-0.8B-bpw4.5
+      // HF id:      mlx-community/Qwen3.5-9B-OptiQ-4bit → Qwen3.5-9B-OptiQ-4bit
+      const parts = m.split('/').filter(Boolean);
+      // Strip trailing 'optiq_mixed' (our quant output dir convention)
+      let candidate = parts[parts.length - 1];
+      if (candidate === 'optiq_mixed' && parts.length > 1) {
+        candidate = parts[parts.length - 2];
+      }
+      // Strip 'Qwen_' / 'Gemma_' etc. prefix added by our path sanitiser
+      candidate = candidate.replace(/^(Qwen|Gemma|Meta|Mistral|Llama)_/, '');
+      return candidate.length > 22 ? candidate.slice(0, 21) + '…' : candidate;
+    },
+    copy(text, ev) {
+      navigator.clipboard.writeText(text);
+      const btn = ev.target;
+      const original = btn.textContent;
+      btn.textContent = '✓';
+      setTimeout(() => { btn.textContent = original; }, 1000);
+    }
+  };
+}
+
+function recentJobs() {
+  return {
+    jobs: [],
+    async poll() {
+      try {
+        const r = await fetch('/api/jobs/recent', { credentials: 'same-origin' });
+        if (r.ok) {
+          const data = await r.json();
+          this.jobs = data.jobs || [];
+        }
+      } catch (e) {}
+      setTimeout(() => this.poll(), 5000);
+    }
+  };
+}
+</script>
