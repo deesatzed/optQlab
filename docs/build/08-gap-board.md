@@ -30,14 +30,14 @@
 | G3 | Tabs ≠ real work loop | P0 | WP-1–2 | 1–2 | 🟡 | Models/Chat/Runs primary; legacy tabs remain |
 | G4 | Can’t prove what made an answer | P0 | WP-2B | 0–2 | 🟡 | Chips + drawer + export; full envelope still partial |
 | G8 | Silent “model is dumb” | P0 | WP-2B | 2 | 🟡 | Healed/retrieval/retries chips; more taxonomy later |
-| G2 | Moat (measurement) invisible | P0 | WP-3 | 3 | 🔴 | Eval GUI + real scores vs CLI identity |
-| T3 | No “my tests” / promote gate | P0 | WP-3B/C | 3 | 🔴 | BYO set + promote blocked on regression |
+| G2 | Moat (measurement) invisible | P0 | WP-3 | 3 | 🟢 | /eval + store + compare + promote gate |
+| T3 | No “my tests” / promote gate | P0 | WP-3B/C | 3 | 🟢 | BYO JSONL + promote API blocks regression |
 | G9 | Global settings only | P1 | WP-2A | 2 | 🟡 | Workspace bar on Chat; not full multi-ws product |
 | T4 | Workspace lies about model | P1 | WP-2A | 2 | 🟢 | Coherence banner when model mismatch |
 | G10 | Chat behind Msty/Open WebUI | P1 | WP-2C | 2 | 🟡 | Search, branch, regen, edit-resend shipped |
 | C1 | Model discovery UX lag | P1 | WP-1C | 1 | 🔴 | Unified Models surface |
 | C2 | Slow path to first useful token | P1 | WP-4F | 4 | 🔴 | Documented + measured clean-machine path |
-| G11 | Best knobs CLI-only | P1 | WP-3E | 3–4 | 🔴 | 5 crown jewels have GUI homes |
+| G11 | Best knobs CLI-only | P1 | WP-3E | 3–4 | 🟡 | Homes on Eval/Models/Server; more flags later |
 | G12 | Remote/auth friction | P1 | WP-4C | 4 | 🔴 | Auth-safe non-localhost |
 | T5 | No guided optimize / recipes | P2 | WP-4A/B | 4 | ⬜ | Recipe round-trip; guided flow |
 | T6 | Integration copy-paste only | P2 | WP-4D | 4 | ⬜ | Probed health only |

@@ -1,0 +1,219 @@
+{% extends "_base.html" %}
+{% block content %}
+<div x-data="evalApp()" x-init="init()">
+  <div class="page-head">
+    <div>
+      <h1 class="page-title">Eval</h1>
+      <p class="page-sub">Measure builds for real — suite via <code>optiq eval</code>, or your own prompt set. Promote only if scores do not regress.</p>
+    </div>
+    <a class="btn btn-ghost" href="{{ url_for('runs.runs_page') }}">Open Runs →</a>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">Run evaluation</div>
+    <div class="form-grid" style="grid-template-columns:1fr 160px 140px">
+      <label>Model path
+        <select class="input" x-model="modelPath">
+          <option value="">— select —</option>
+          {% for m in models %}
+          <option value="{{ m.path }}">{{ m.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Suite
+        <select class="input" x-model="suite">
+          <option value="gsm8k-50">gsm8k-50 (CLI)</option>
+          <option value="smoketest">smoketest (CLI)</option>
+          <option value="mmlu">mmlu (CLI)</option>
+          <option value="byo">BYO prompt set</option>
+        </select>
+      </label>
+      <label x-show="suite === 'byo'">Eval set
+        <select class="input" x-model="evalSetId">
+          <option value="">— set —</option>
+          <template x-for="s in sets" :key="s.id">
+            <option :value="s.id" x-text="s.name + ' (' + s.n_items + ')'"></option>
+          </template>
+        </select>
+      </label>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-primary" type="button" @click="runEval()" :disabled="!modelPath || running">Start eval job</button>
+      <span class="muted" x-text="runMsg"></span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">Import BYO eval set</div>
+    <p class="muted" style="font-size:13px">JSONL lines: <code>{"prompt":"...","expected":"..."}</code> — scored by real model generation + string match.</p>
+    <label>Name <input class="input" x-model="newSetName" placeholder="clinical-40"></label>
+    <label style="display:block;margin-top:8px">JSONL
+      <textarea class="input" rows="5" x-model="newSetJsonl" style="font-family:var(--mono);font-size:12px"
+        placeholder='{"prompt":"What is 2+2?","expected":"4"}'></textarea>
+    </label>
+    <button class="btn btn-ghost" type="button" style="margin-top:8px" @click="importSet()">Import set</button>
+    <span class="muted" x-text="importMsg"></span>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">Compare &amp; promote gate</div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
+      <label>Baseline eval id <input class="input" x-model="baselineId" placeholder="eval_…"></label>
+      <label>Candidate eval id <input class="input" x-model="candidateId" placeholder="eval_…"></label>
+      <button class="btn btn-ghost" type="button" @click="compare()">Compare</button>
+      <button class="btn btn-primary" type="button" @click="promote()">Check promote</button>
+    </div>
+    <pre class="run-log" style="margin-top:12px" x-show="compareOut" x-text="compareOut"></pre>
+    <div class="flash" style="margin-top:10px"
+         :class="promoteAllowed === true ? 'flash-ok' : (promoteAllowed === false ? 'flash-err' : '')"
+         x-show="promoteMsg" x-text="promoteMsg"></div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">Knob consequences (estimates)</div>
+    <p class="muted" style="font-size:13px">Fit Engine ΔGB only — not measured tok/s or capability. Labels estimates honestly.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input class="input" style="width:280px" x-model="modelPath" placeholder="model path">
+      <button class="btn btn-ghost" type="button" @click="consequences()">Preview</button>
+    </div>
+    <template x-if="consRows.length">
+      <table class="table" style="margin-top:10px">
+        <thead><tr><th>Knob</th><th>Total GB</th><th>ΔGB</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <template x-for="r in consRows" :key="r.label">
+            <tr>
+              <td x-text="r.label"></td>
+              <td x-text="r.total_gb"></td>
+              <td x-text="(r.delta_gb>=0?'+':'')+r.delta_gb"></td>
+              <td><span class="pill" :class="r.blocks_load ? 'pill-err' : 'pill-ok'" x-text="r.verdict"></span></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </template>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Recent results</div>
+    <table class="table">
+      <thead><tr><th>Id</th><th>Suite</th><th>Score</th><th>Build</th><th>When</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="e in results" :key="e.id">
+          <tr>
+            <td style="font-family:var(--mono);font-size:12px" x-text="e.id"></td>
+            <td x-text="e.suite"></td>
+            <td x-text="e.scores?.capability_score ?? '—'"></td>
+            <td style="font-size:12px" x-text="e.build_id || '—'"></td>
+            <td class="muted" style="font-size:12px" x-text="e.created_at"></td>
+            <td>
+              <button class="btn btn-ghost btn-sm" type="button" @click="baselineId = e.id">As baseline</button>
+              <button class="btn btn-ghost btn-sm" type="button" @click="candidateId = e.id">As candidate</button>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <div class="card-title">Crown-jewel controls (GUI homes)</div>
+    <ul style="margin:0;padding-left:18px;font-size:14px;line-height:1.7">
+      <li><strong>KV bits / context</strong> — <a href="{{ url_for('models.models_page') }}">Models → Load with Fit</a> + consequence table above</li>
+      <li><strong>MTP / drafter</strong> — <a href="{{ url_for('settings.server') }}">Settings → Server</a></li>
+      <li><strong>Adapters</strong> — Chat adapter picker (from mounted server) + Server page</li>
+      <li><strong>Idle / memory</strong> — Machine strip (always on) + Fit calibrate</li>
+      <li><strong>Eval / Capability</strong> — this page (not Hub folklore)</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+function evalApp() {
+  return {
+    modelPath: '',
+    suite: 'gsm8k-50',
+    evalSetId: '',
+    sets: {{ eval_sets | tojson }},
+    results: {{ recent | tojson }},
+    runMsg: '',
+    running: false,
+    newSetName: '',
+    newSetJsonl: '',
+    importMsg: '',
+    baselineId: '',
+    candidateId: '',
+    compareOut: '',
+    promoteMsg: '',
+    promoteAllowed: null,
+    consRows: [],
+    async init() { await this.refresh(); },
+    async refresh() {
+      const r = await fetch('/api/eval/results', { credentials: 'same-origin' });
+      if (r.ok) this.results = (await r.json()).evals || [];
+      const s = await fetch('/api/eval/sets', { credentials: 'same-origin' });
+      if (s.ok) this.sets = (await s.json()).sets || [];
+    },
+    async runEval() {
+      this.running = true;
+      this.runMsg = 'Submitting…';
+      const body = { model_path: this.modelPath, suite: this.suite, eval_set_id: this.evalSetId || undefined };
+      const r = await fetch('/api/eval/run', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      this.running = false;
+      if (!r.ok) { this.runMsg = d.error || 'failed'; return; }
+      this.runMsg = 'Job ' + d.job_id + ' — watch Runs. Results appear here when done.';
+    },
+    async importSet() {
+      this.importMsg = '';
+      const r = await fetch('/api/eval/sets', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ name: this.newSetName, jsonl: this.newSetJsonl }),
+      });
+      const d = await r.json();
+      if (!r.ok) { this.importMsg = d.error || 'failed'; return; }
+      this.importMsg = 'Imported ' + d.id;
+      this.evalSetId = d.id;
+      await this.refresh();
+    },
+    async compare() {
+      this.compareOut = '';
+      const r = await fetch('/api/eval/compare', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ a: this.baselineId, b: this.candidateId }),
+      });
+      const d = await r.json();
+      if (!r.ok) { this.compareOut = d.error || 'failed'; return; }
+      this.compareOut = JSON.stringify(d.compare, null, 2);
+    },
+    async promote() {
+      this.promoteMsg = '';
+      this.promoteAllowed = null;
+      const r = await fetch('/api/eval/promote', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ baseline: this.baselineId, candidate: this.candidateId }),
+      });
+      const d = await r.json();
+      if (!r.ok) { this.promoteMsg = d.error || 'failed'; return; }
+      this.promoteAllowed = d.allowed;
+      this.promoteMsg = d.reason;
+    },
+    async consequences() {
+      this.consRows = [];
+      const r = await fetch('/api/fit/consequences', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ path: this.modelPath, ctx: 32768, kv_bits: 8 }),
+      });
+      const d = await r.json();
+      if (d.ok) this.consRows = d.variants || [];
+    },
+  };
+}
+</script>
+{% endblock %}

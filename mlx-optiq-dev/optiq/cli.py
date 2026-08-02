@@ -1152,6 +1152,9 @@ def _run_gsm8k(model_path, baseline, n_samples, opts=None, output_json=None):
         for name, r in all_results:
             click.echo(f"  {name:<30} {r.accuracy:>9.1%}")
         click.echo(f"  {'=' * 50}")
+    # Lab WP-3 / --output-json: write primary model result
+    if all_results:
+        _dump_task_json(output_json, model_path, "gsm8k", all_results[0][1])
 
 
 def _mmlu_fn(model_path):
