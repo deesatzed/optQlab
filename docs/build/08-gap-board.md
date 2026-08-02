@@ -21,10 +21,10 @@
 
 | Gap ID | Gap (user impact) | Tier | WP | Phase | Status | Exit metric / verification |
 |--------|-------------------|------|-----|-------|--------|----------------------------|
-| C3 | Demo looks like live product | P0 | WP-0 | Now | 🔴 | Prototype labeled; dead controls disarmed |
-| G1 | Loads crash/thrash without warning | P0 | WP-1A | 1 | 🔴 | Fit blocks hard-fail; real memory model |
-| G7 | Three ways to load model | P0 | WP-1C | 1 | 🔴 | Single Load path only |
-| — | Machine invisible | P0 | WP-1B | 1 | 🔴 | Strip shows real RAM + port probes |
+| C3 | Demo looks like live product | P0 | WP-0 | Now | 🟢 | Prototype banner + disabled controls + README |
+| G1 | Loads crash/thrash without warning | P0 | WP-1A | 1 | 🟢 | Fit Engine + 409 on load; tests green |
+| G7 | Three ways to load model | P0 | WP-1C | 1 | 🟡 | Primary path Models/Fit; Server advanced remains |
+| — | Machine invisible | P0 | WP-1B | 1 | 🟢 | Strip + /api/machine real RAM/probes |
 | G5 | Jobs fight for RAM/model | P0 | WP-1 + bus | 0–1 | 🟡 | Sequential bus backend 🟢; UI admission 🔴 |
 | G6 | Lose multi-hour jobs in UI | P0 | WP-2D | 0–2 | 🟡 | Bus 🟢; global Runs UI 🔴 |
 | G3 | Tabs ≠ real work loop | P0 | WP-1–2 | 1–2 | 🔴 | Work/Models/Runs shell live |

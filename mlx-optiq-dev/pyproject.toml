@@ -21,6 +21,7 @@ dependencies = [
   "ddgs>=9.0",
   "html2text>=2024.0",
   "flask",
+  "psutil",
 ]
 
 [project.optional-dependencies]

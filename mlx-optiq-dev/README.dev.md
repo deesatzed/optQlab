@@ -30,8 +30,22 @@ Verify the import resolves to this worktree:
 
 Tests use a real temp `OPTIQ_HOME` (see `tests/lab/conftest.py`). No mocks.
 
+## Critical-gap mitigations (WP-0 / WP-1)
+
+| Feature | Route / module |
+|---------|----------------|
+| Fit Engine | `optiq/lab/fit_engine.py`, `POST /api/fit/predict`, `POST /api/fit/calibrate` |
+| Fit-gated load | `POST /api/models/load` (409 when blocked unless `force`) |
+| Models UI | `/models` |
+| Machine strip | `_base.html` + `GET /api/machine` (real RAM + TCP probes) |
+
+```bash
+pytest tests/lab/test_fit_engine.py tests/lab/test_machine.py tests/lab/test_models_fit_api.py -v
+```
+
 ## Constraints
 
 - Do not edit the site-packages copy under miniforge3
 - No mock data, placeholders, or cached fake responses
+- Never invent Capability Scores in Fit
 - Commit work in this repo only

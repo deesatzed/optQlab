@@ -2,9 +2,16 @@
    Status panel polls /api/status every 5s via Alpine.js. #}
 
 <div class="side-group">
+  <div class="side-label">Primary</div>
+  <nav class="side-nav">
+    <a href="{{ url_for('models.models_page') }}" class="{% if section == 'models' %}is-active{% endif %}">Models</a>
+    <a href="{{ url_for('chat.chat_page') }}" class="{% if section == 'chat' %}is-active{% endif %}">Chat</a>
+  </nav>
+</div>
+
+<div class="side-group">
   <div class="side-label">Workflows</div>
   <nav class="side-nav">
-    <a href="{{ url_for('chat.chat_page') }}" class="{% if section == 'chat' %}is-active{% endif %}">Chat</a>
     <a href="{{ url_for('arena.arena_page') }}" class="{% if section == 'arena' %}is-active{% endif %}">Arena</a>
     <a href="{{ url_for('hub.hub_page') }}" class="{% if section == 'hub' %}is-active{% endif %}">Hub</a>
     <a href="{{ url_for('quantize.quantize_page') }}" class="{% if section == 'quantize' %}is-active{% endif %}">Quantize</a>

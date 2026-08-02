@@ -113,6 +113,8 @@ def server():
     from ..mlx_cleanup import default_prompt_cache_bytes
     default_pc_gb = round(default_prompt_cache_bytes() / 1024**3, 2)
 
+    # Prefer unified Models → Load (Fit-gated). Server page remains for
+    # advanced MTP/sampler; primary load path is /models.
     return render_template(
         "settings_server.html",
         page_title="Server",
@@ -125,6 +127,7 @@ def server():
         api_port=api_port,
         quants=quants,
         default_pc_gb=default_pc_gb,
+        prefer_models_load=True,
     )
 
 

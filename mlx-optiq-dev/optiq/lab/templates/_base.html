@@ -21,18 +21,78 @@
     {% include '_sidebar.html' %}
   </aside>
 
-  <main class="app-main">
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for category, msg in messages %}
-          <div class="flash flash-{{ category }}">{{ msg }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
+  <div class="app-body">
+    {# Machine strip — always visible; polls real /api/machine (WP-1) #}
+    <header class="machine-strip" x-data="machineStrip()" x-init="poll()" @click="open = !open">
+      <span class="ms-dot" :class="portsOk ? 'ok' : 'bad'"></span>
+      <span class="ms-model" x-text="shortModel(state.model) || 'No model loaded'"></span>
+      <span class="ms-sep">·</span>
+      <span class="ms-ram">
+        RAM
+        <span class="ms-bar"><span class="ms-bar-fill" :style="'width:' + (state.memory?.used_pct || 0) + '%'"></span></span>
+        <span x-text="(state.memory?.used_ram_gb ?? '—') + ' / ' + (state.memory?.total_ram_gb ?? '—') + ' GB'"></span>
+      </span>
+      <span class="ms-sep">·</span>
+      <span class="ms-port" x-text="'serve :' + (state.ports?.serve?.port || '—')"></span>
+      <span class="pill" :class="state.ports?.serve?.healthy ? 'pill-ok' : 'pill-err'"
+            x-text="state.ports?.serve?.healthy ? 'up' : 'down'"></span>
+      <span class="ms-sep">·</span>
+      <span class="ms-jobs" x-text="(state.running_jobs || 0) + ' job(s)'"></span>
+      <a class="ms-link" href="{{ url_for('models.models_page') }}" @click.stop>Models / Load</a>
+      <template x-if="open">
+        <div class="machine-panel" @click.stop>
+          <div class="row"><span class="k">Model</span><span class="v" x-text="state.model || '—'"></span></div>
+          <div class="row"><span class="k">Free RAM</span><span class="v" x-text="(state.memory?.free_ram_gb ?? '—') + ' GB'"></span></div>
+          <div class="row"><span class="k">Lab port</span>
+            <span class="v"><span class="pill" :class="state.ports?.lab?.healthy ? 'pill-ok' : 'pill-err'"
+              x-text="state.ports?.lab?.healthy ? 'healthy' : 'down'"></span></span>
+          </div>
+          <div class="row"><span class="k">Fit calibrated</span>
+            <span class="v" x-text="state.fit_calibrated ? 'yes' : 'no — open Models → Calibrate'"></span>
+          </div>
+        </div>
+      </template>
+    </header>
 
-    {% block content %}{% endblock %}
-  </main>
+    <main class="app-main">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, msg in messages %}
+            <div class="flash flash-{{ category }}">{{ msg }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      {% block content %}{% endblock %}
+    </main>
+  </div>
 </div>
 
+<script>
+function machineStrip() {
+  return {
+    open: false,
+    state: { memory: {}, ports: { serve: {}, lab: {} }, model: null, running_jobs: 0 },
+    get portsOk() {
+      return !!(this.state.ports && this.state.ports.serve && this.state.ports.serve.healthy);
+    },
+    shortModel(m) {
+      if (!m) return '';
+      const parts = String(m).split('/').filter(Boolean);
+      let c = parts[parts.length - 1];
+      if (c === 'optiq_mixed' && parts.length > 1) c = parts[parts.length - 2];
+      return c.length > 36 ? c.slice(0, 35) + '…' : c;
+    },
+    async poll() {
+      try {
+        const r = await fetch('/api/machine', { credentials: 'same-origin' });
+        if (r.ok) this.state = await r.json();
+      } catch (e) {}
+      setTimeout(() => this.poll(), 4000);
+    }
+  };
+}
+</script>
 </body>
 </html>
+

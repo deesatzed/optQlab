@@ -1,0 +1,176 @@
+{% extends "_base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">Models</h1>
+    <p class="page-sub">One place to browse builds and load with Fit check (blocks unsafe loads).</p>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <button class="btn btn-ghost" type="button" id="btn-calibrate">Calibrate Fit</button>
+    <span class="pill pill-idle" id="cal-status">—</span>
+  </div>
+</div>
+
+{% if loaded %}
+<div class="flash flash-ok" style="margin-bottom:12px">Loaded: <code>{{ loaded }}</code></div>
+{% endif %}
+
+<div class="card" style="margin-bottom:16px">
+  <div class="card-title">Load with Fit</div>
+  <p class="muted" style="font-size:13px;margin:0 0 12px">
+    Predicts weights + KV + activations vs free memory. Estimates are labeled; Capability Score is never invented here.
+  </p>
+  <div class="form-grid">
+    <label>Model path or HF id
+      <select id="load-model" class="input">
+        <option value="">— select —</option>
+        {% for m in models %}
+        <option value="{{ m.path }}" data-size="{{ m.size_gb or '' }}">{{ m.name }} · {{ m.bits_label }} · {{ m.source }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Context
+      <input class="input" type="number" id="load-ctx" value="32768" min="512" step="512">
+    </label>
+    <label>KV bits
+      <input class="input" type="number" id="load-kv" value="8" min="2" max="16" step="1">
+    </label>
+  </div>
+  <div id="fit-panel" class="fit-panel" hidden>
+    <div class="fit-bar-wrap"><div class="fit-bar" id="fit-bar"></div></div>
+    <div class="fit-verdict" id="fit-verdict"></div>
+    <div class="fit-detail muted" id="fit-detail"></div>
+    <div class="fit-breakdown" id="fit-breakdown"></div>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:12px">
+    <button class="btn btn-ghost" type="button" id="btn-predict">Predict Fit</button>
+    <button class="btn btn-primary" type="button" id="btn-load">Load model</button>
+    <button class="btn btn-ghost" type="button" id="btn-force" hidden>Force load anyway</button>
+  </div>
+  <div id="load-msg" class="muted" style="margin-top:8px;font-size:13px"></div>
+</div>
+
+<div class="card">
+  <div class="card-title">Available ({{ models|length }})</div>
+  <table class="table">
+    <thead>
+      <tr><th>Name</th><th>Source</th><th>Profile</th><th>Size</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for m in models %}
+      <tr>
+        <td>{{ m.name }}</td>
+        <td><span class="pill pill-idle">{{ m.source }}</span></td>
+        <td>{{ m.bits_label }}{% if m.bpw_detail %} · {{ m.bpw_detail }}{% endif %}</td>
+        <td>{% if m.size_gb %}{{ m.size_gb }} GB{% else %}—{% endif %}</td>
+        <td><button class="btn btn-ghost btn-sm pick-model" type="button" data-path="{{ m.path }}">Use</button></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">No local models found. Quantize one or pull an MLX snapshot into the HF cache.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const modelSel = $('load-model');
+  const msg = $('load-msg');
+  let lastFit = null;
+
+  document.querySelectorAll('.pick-model').forEach(btn => {
+    btn.addEventListener('click', () => {
+      modelSel.value = btn.dataset.path;
+      predict();
+    });
+  });
+
+  async function predict() {
+    const path = modelSel.value;
+    if (!path) { msg.textContent = 'Select a model first.'; return; }
+    msg.textContent = 'Predicting…';
+    const body = {
+      path,
+      ctx: parseInt($('load-ctx').value, 10) || 32768,
+      kv_bits: parseInt($('load-kv').value, 10) || 8,
+    };
+    const r = await fetch('/api/fit/predict', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!data.ok) { msg.textContent = data.error || 'Fit failed'; return; }
+    lastFit = data.fit;
+    showFit(data.fit);
+    msg.textContent = data.fit.blocks_load ? 'Load blocked by Fit — change knobs or force.' : 'Fit OK — safe to load.';
+    $('btn-force').hidden = !data.fit.blocks_load;
+  }
+
+  function showFit(fit) {
+    const panel = $('fit-panel');
+    panel.hidden = false;
+    const pct = Math.min(100, Math.round((fit.total_gb / Math.max(fit.free_ram_gb, 0.01)) * 100));
+    const bar = $('fit-bar');
+    bar.style.width = pct + '%';
+    bar.className = 'fit-bar fit-' + fit.verdict;
+    $('fit-verdict').textContent = fit.title + ' · ' + fit.verdict;
+    $('fit-verdict').className = 'fit-verdict fit-' + fit.verdict;
+    $('fit-detail').textContent = fit.detail;
+    $('fit-breakdown').textContent =
+      `weights ${fit.weights_gb} · KV ${fit.kv_gb} · act ${fit.act_gb} · reserved ${fit.reserved_gb} GB · free RAM ${fit.free_ram_gb} GB`
+      + (fit.estimate_notes && fit.estimate_notes.length ? ' · notes: ' + fit.estimate_notes.join('; ') : '');
+  }
+
+  async function load(force) {
+    const path = modelSel.value;
+    if (!path) { msg.textContent = 'Select a model first.'; return; }
+    msg.textContent = force ? 'Force loading…' : 'Loading…';
+    const body = {
+      model: path,
+      ctx: parseInt($('load-ctx').value, 10) || 32768,
+      kv_bits: parseInt($('load-kv').value, 10) || 8,
+      force: !!force,
+    };
+    const r = await fetch('/api/models/load', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (r.status === 409) {
+      lastFit = data.fit;
+      if (data.fit) showFit(data.fit);
+      msg.textContent = data.message || 'Blocked by Fit';
+      $('btn-force').hidden = false;
+      return;
+    }
+    if (!data.ok) { msg.textContent = data.error || 'Load failed'; return; }
+    msg.textContent = 'Load requested: ' + (data.status || 'ok') + ' · ' + (data.model || path);
+    if (data.fit) showFit(data.fit);
+  }
+
+  $('btn-predict').addEventListener('click', predict);
+  $('btn-load').addEventListener('click', () => load(false));
+  $('btn-force').addEventListener('click', () => {
+    if (confirm('Force load even though Fit blocked? Risk of OOM/swap.')) load(true);
+  });
+  $('load-ctx').addEventListener('change', () => { if (modelSel.value) predict(); });
+  $('load-kv').addEventListener('change', () => { if (modelSel.value) predict(); });
+
+  $('btn-calibrate').addEventListener('click', async () => {
+    $('cal-status').textContent = '…';
+    const r = await fetch('/api/fit/calibrate', { method: 'POST', credentials: 'same-origin' });
+    const data = await r.json();
+    if (data.ok) {
+      $('cal-status').textContent = 'calibrated · reserved ' + data.calibration.reserved_gb + ' GB';
+      $('cal-status').className = 'pill pill-ok';
+    } else {
+      $('cal-status').textContent = data.error || 'failed';
+      $('cal-status').className = 'pill pill-err';
+    }
+  });
+})();
+</script>
+{% endblock %}

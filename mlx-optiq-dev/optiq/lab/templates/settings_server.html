@@ -3,6 +3,13 @@
 <div x-data="serverSettings()" x-init="init()">
 <span class="page-eyebrow">Settings · Server</span>
 <h1 class="page-title">Model server</h1>
+{% if prefer_models_load %}
+<div class="flash flash-ok" style="margin-bottom:14px">
+  <strong>Primary load path:</strong>
+  <a href="{{ url_for('models.models_page') }}">Models → Load with Fit</a>
+  (blocks unsafe loads). This page is for advanced server / MTP options.
+</div>
+{% endif %}
 <p class="page-lead">
   Pick a local OptiQ quant and (optionally) MTP speculation, click Apply, and
   the Lab swaps the running model without restarting. Switching takes
