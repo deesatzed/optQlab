@@ -25,16 +25,16 @@
 | G1 | Loads crash/thrash without warning | P0 | WP-1A | 1 | 🟢 | Fit Engine + 409 on load; tests green |
 | G7 | Three ways to load model | P0 | WP-1C | 1 | 🟡 | Primary path Models/Fit; Server advanced remains |
 | — | Machine invisible | P0 | WP-1B | 1 | 🟢 | Strip + /api/machine real RAM/probes |
-| G5 | Jobs fight for RAM/model | P0 | WP-1 + bus | 0–1 | 🟡 | Sequential bus backend 🟢; UI admission 🔴 |
-| G6 | Lose multi-hour jobs in UI | P0 | WP-2D | 0–2 | 🟡 | Bus 🟢; global Runs UI 🔴 |
-| G3 | Tabs ≠ real work loop | P0 | WP-1–2 | 1–2 | 🔴 | Work/Models/Runs shell live |
-| G4 | Can’t prove what made an answer | P0 | WP-2B | 0–2 | 🟡 | Spine/partial capture 🟢; full UI+complete 🔴 |
-| G8 | Silent “model is dumb” | P0 | WP-2B | 2 | 🔴 | Health chips for truncation/retrieval/thinking/… |
+| G5 | Jobs fight for RAM/model | P0 | WP-1 + bus | 0–1 | 🟡 | Sequential bus 🟢; dual-resident still sequential |
+| G6 | Lose multi-hour jobs in UI | P0 | WP-2D | 0–2 | 🟢 | Global Runs page + cancel + log |
+| G3 | Tabs ≠ real work loop | P0 | WP-1–2 | 1–2 | 🟡 | Models/Chat/Runs primary; legacy tabs remain |
+| G4 | Can’t prove what made an answer | P0 | WP-2B | 0–2 | 🟡 | Chips + drawer + export; full envelope still partial |
+| G8 | Silent “model is dumb” | P0 | WP-2B | 2 | 🟡 | Healed/retrieval/retries chips; more taxonomy later |
 | G2 | Moat (measurement) invisible | P0 | WP-3 | 3 | 🔴 | Eval GUI + real scores vs CLI identity |
 | T3 | No “my tests” / promote gate | P0 | WP-3B/C | 3 | 🔴 | BYO set + promote blocked on regression |
-| G9 | Global settings only | P1 | WP-2A | 2 | 🟡 | Schema 🟢; workspace UX 🔴 |
-| T4 | Workspace lies about model | P1 | WP-2A | 2 | 🟡 | Coherence banner when not resident |
-| G10 | Chat behind Msty/Open WebUI | P1 | WP-2C | 2 | 🔴 | Edit/resend, branch, search, regen |
+| G9 | Global settings only | P1 | WP-2A | 2 | 🟡 | Workspace bar on Chat; not full multi-ws product |
+| T4 | Workspace lies about model | P1 | WP-2A | 2 | 🟢 | Coherence banner when model mismatch |
+| G10 | Chat behind Msty/Open WebUI | P1 | WP-2C | 2 | 🟡 | Search, branch, regen, edit-resend shipped |
 | C1 | Model discovery UX lag | P1 | WP-1C | 1 | 🔴 | Unified Models surface |
 | C2 | Slow path to first useful token | P1 | WP-4F | 4 | 🔴 | Documented + measured clean-machine path |
 | G11 | Best knobs CLI-only | P1 | WP-3E | 3–4 | 🔴 | 5 crown jewels have GUI homes |

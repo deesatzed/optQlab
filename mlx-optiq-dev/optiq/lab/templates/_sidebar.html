@@ -6,6 +6,7 @@
   <nav class="side-nav">
     <a href="{{ url_for('models.models_page') }}" class="{% if section == 'models' %}is-active{% endif %}">Models</a>
     <a href="{{ url_for('chat.chat_page') }}" class="{% if section == 'chat' %}is-active{% endif %}">Chat</a>
+    <a href="{{ url_for('runs.runs_page') }}" class="{% if section == 'runs' %}is-active{% endif %}">Runs</a>
   </nav>
 </div>
 

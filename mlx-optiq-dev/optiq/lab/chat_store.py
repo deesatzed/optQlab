@@ -203,6 +203,62 @@ def list_chat_records() -> list[dict]:
     return out
 
 
+def search_chat_records(query: str, *, limit: int = 50) -> list[dict]:
+    """Search chats by title, model, or message content (case-insensitive).
+
+    Returns the same list shape as ``list_chat_records``, filtered.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return list_chat_records()[:limit]
+
+    # Prefer DB full-text-ish LIKE over messages + conversations
+    conn = db.get_conn()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT c.id
+        FROM conversations c
+        LEFT JOIN messages m ON m.conversation_id = c.id
+        WHERE lower(c.title) LIKE ?
+           OR lower(ifnull(c.model, '')) LIKE ?
+           OR lower(ifnull(m.content, '')) LIKE ?
+        ORDER BY c.updated_at DESC
+        LIMIT ?
+        """,
+        (f"%{q}%", f"%{q}%", f"%{q}%", int(limit)),
+    ).fetchall()
+    if rows:
+        out: list[dict] = []
+        for r in rows:
+            rec = load_chat_record(r["id"])
+            if not rec:
+                continue
+            out.append({
+                "id": rec["id"],
+                "title": rec.get("title") or "Untitled chat",
+                "model": rec.get("model") or "",
+                "updated_at": rec.get("updated_at"),
+                "n_messages": len(rec.get("messages") or []),
+            })
+        return out
+
+    # File fallback
+    hits = []
+    for item in list_chat_records():
+        blob = f"{item.get('title','')} {item.get('model','')}".lower()
+        path = _chat_path(item["id"])
+        if path.is_file():
+            try:
+                blob += " " + path.read_text().lower()
+            except OSError:
+                pass
+        if q in blob:
+            hits.append(item)
+        if len(hits) >= limit:
+            break
+    return hits
+
+
 def delete_chat_record(chat_id: str) -> bool:
     """Delete JSON file and conversation/messages/provenance from DB.
 

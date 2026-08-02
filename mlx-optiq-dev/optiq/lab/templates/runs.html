@@ -1,0 +1,136 @@
+{% extends "_base.html" %}
+{% block content %}
+<div class="page-head" x-data="runsApp()" x-init="poll()">
+  <div>
+    <h1 class="page-title">Runs</h1>
+    <p class="page-sub">All long jobs — navigate freely; progress stays here. Cancel running work without losing the rest of the Lab.</p>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <select class="input" x-model="filter" @change="load()" style="width:auto">
+      <option value="all">All statuses</option>
+      <option value="running">Running</option>
+      <option value="queued">Queued</option>
+      <option value="done">Done</option>
+      <option value="failed">Failed</option>
+      <option value="cancelled">Cancelled</option>
+      <option value="zombie">Zombie</option>
+    </select>
+    <button class="btn btn-ghost" type="button" @click="load()">Refresh</button>
+  </div>
+
+  <div class="card" style="margin-top:16px;width:100%">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Kind</th>
+          <th>Status</th>
+          <th>Progress</th>
+          <th>Message</th>
+          <th>Started</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-if="runs.length === 0">
+          <tr><td colspan="6" class="muted">No runs yet. Quantize, fine-tune, or dataset jobs appear here.</td></tr>
+        </template>
+        <template x-for="r in runs" :key="r.id">
+          <tr>
+            <td><span class="pill pill-idle" x-text="r.kind"></span></td>
+            <td>
+              <span class="pill"
+                    :class="{
+                      'pill-ok': r.status === 'done',
+                      'pill-err': r.status === 'failed' || r.status === 'zombie',
+                      'pill-running': r.status === 'running',
+                      'pill-idle': r.status === 'queued' || r.status === 'cancelled'
+                    }"
+                    x-text="r.status"></span>
+            </td>
+            <td>
+              <template x-if="r.status === 'running' || r.status === 'queued'">
+                <span x-text="Math.round((r.progress || 0) * 100) + '%'"></span>
+              </template>
+              <template x-if="r.status !== 'running' && r.status !== 'queued'">
+                <span class="muted">—</span>
+              </template>
+            </td>
+            <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                :title="r.error || r.message || ''"
+                x-text="r.error || r.message || '—'"></td>
+            <td class="muted" style="font-size:12px" x-text="r.started_at || '—'"></td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-ghost btn-sm" type="button" @click="showLog(r)">Log</button>
+              <button class="btn btn-ghost btn-sm" type="button"
+                      x-show="r.status === 'running' || r.status === 'queued'"
+                      @click="cancel(r)">Cancel</button>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card" x-show="logJob" style="margin-top:16px;width:100%" x-cloak>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <strong x-text="'Log · ' + (logJob?.id || '')"></strong>
+      <button class="btn btn-ghost btn-sm" type="button" @click="logJob = null; logLines = []">Close</button>
+    </div>
+    <pre class="run-log" x-text="logLines.join('\n') || '(empty)'"></pre>
+  </div>
+</div>
+
+<style>
+.run-log {
+  max-height: 360px; overflow: auto;
+  font-family: var(--mono); font-size: 11px;
+  background: var(--code-bg); padding: 12px; border-radius: var(--r-md);
+  white-space: pre-wrap; word-break: break-word;
+}
+[x-cloak] { display: none !important; }
+</style>
+
+<script>
+function runsApp() {
+  return {
+    runs: [],
+    filter: 'all',
+    logJob: null,
+    logLines: [],
+    async load() {
+      const q = this.filter === 'all' ? '' : ('?status=' + encodeURIComponent(this.filter));
+      try {
+        const r = await fetch('/api/runs' + q, { credentials: 'same-origin' });
+        if (r.ok) {
+          const data = await r.json();
+          this.runs = data.runs || [];
+        }
+      } catch (e) {}
+    },
+    async poll() {
+      await this.load();
+      setTimeout(() => this.poll(), 3000);
+    },
+    async cancel(run) {
+      if (!confirm('Cancel run ' + run.id + '?')) return;
+      const r = await fetch('/api/runs/' + encodeURIComponent(run.id) + '/cancel', {
+        method: 'POST', credentials: 'same-origin',
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) alert(data.error || 'Cancel failed');
+      await this.load();
+    },
+    async showLog(run) {
+      this.logJob = run;
+      this.logLines = ['loading…'];
+      const r = await fetch('/api/runs/' + encodeURIComponent(run.id) + '/log?tail=300', {
+        credentials: 'same-origin',
+      });
+      if (!r.ok) { this.logLines = ['(failed to load log)']; return; }
+      const data = await r.json();
+      this.logLines = data.lines || [];
+    },
+  };
+}
+</script>
+{% endblock %}

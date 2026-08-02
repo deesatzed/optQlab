@@ -28,6 +28,7 @@ from .routes import hub as hub_routes
 from .routes import quantize as quantize_routes
 from .routes import settings as settings_routes
 from .routes import models as models_routes
+from .routes import runs as runs_routes
 from .routes import spine_api as spine_api_routes
 
 
@@ -97,6 +98,7 @@ def create_app(
     app.register_blueprint(dataset_routes.bp)
     app.register_blueprint(settings_routes.bp)
     app.register_blueprint(models_routes.bp)
+    app.register_blueprint(runs_routes.bp)
 
     # Make config + helpers available in every template
     @app.context_processor

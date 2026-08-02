@@ -60,6 +60,9 @@ def chat_page():
 
 @bp.route("/api/chats", methods=["GET"])
 def list_chats():
+    q = (request.args.get("q") or "").strip()
+    if q:
+        return jsonify({"chats": chat_store.search_chat_records(q), "q": q})
     return jsonify({"chats": chat_store.list_chat_records()})
 
 
@@ -196,6 +199,21 @@ def chat_stream():
                         retry_hits += 1
                 elif event == "assistant" and isinstance(payload, dict):
                     assistant_content = payload.get("content") or ""
+
+            # Run-health summary for the UI (WP-2B) — never invent tok/s.
+            retrieval_empty = bool(documents) and not rag_sources
+            health = {
+                "healed": healed_any,
+                "retry_hits": retry_hits,
+                "tools_called": tools_called,
+                "retrieved_chunks": len(rag_sources),
+                "retrieval_empty": retrieval_empty,
+                "context_window": data.get("context_window"),
+                "tok_per_sec": None,
+            }
+            yield (
+                f"event: health\ndata: {json.dumps(health)}\n\n".encode("utf-8")
+            )
 
             # Partial provenance on stream end when client supplied chat_id.
             chat_id = data.get("chat_id")

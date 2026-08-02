@@ -3,16 +3,47 @@
 <div x-data="chatApp()" x-init="init()" style="max-width: 1180px;"
      :style="{ maxWidth: artifact ? '1560px' : '1180px' }"
      x-effect="document.body.classList.toggle('artifact-open', !!artifact)">
-  <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 16px;">
+  <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap;">
     <div>
-      <span class="page-eyebrow">Workflow · chat</span>
+      <span class="page-eyebrow">Work · conversation</span>
       <h1 class="page-title" style="margin-bottom: 4px;">Chat</h1>
-      <p class="page-lead" style="margin-bottom: 12px;">Talk to the loaded model. Tools (web search, Python, terminal) run locally in a sandbox.</p>
+      <p class="page-lead" style="margin-bottom: 12px;">Talk to the loaded model. Modes: Chat · Research. Tools run locally. Run health chips explain failures.</p>
     </div>
-    <div style="display: flex; gap: 8px;">
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+      <div class="seg-modes">
+        <button type="button" class="seg-btn" :class="!deepResearch ? 'is-on' : ''"
+                @click="deepResearch = false; localStorage.setItem('optiq.chat.deepResearch', '0')">Chat</button>
+        <button type="button" class="seg-btn" :class="deepResearch ? 'is-on' : ''"
+                @click="deepResearch = true; localStorage.setItem('optiq.chat.deepResearch', '1')">Research</button>
+      </div>
       <button class="btn btn-ghost" @click="resetThread()">New chat</button>
+      <button class="btn btn-ghost" @click="branchThread()" :disabled="messages.length === 0" title="Fork thread to a new chat id">Branch</button>
       <button class="btn" @click="save()" :disabled="messages.length === 0">Save</button>
     </div>
+  </div>
+
+  {# Workspace rail (WP-2A) #}
+  <div class="card ws-bar" style="margin-bottom: 12px; padding: 12px 14px;">
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
+      <div class="form-row" style="margin:0;min-width:180px">
+        <label>Workspace</label>
+        <select class="input" x-model="workspaceId" @change="onWorkspaceChange()">
+          <option value="">— none —</option>
+          <template x-for="w in workspaces" :key="w.id">
+            <option :value="w.id" x-text="w.name"></option>
+          </template>
+        </select>
+      </div>
+      <button class="btn btn-ghost btn-sm" type="button" @click="createWorkspace()">+ Workspace</button>
+      <div class="form-row" style="margin:0;flex:1;min-width:200px">
+        <label>System prompt (workspace)</label>
+        <input class="input" type="text" x-model="systemPrompt" @change="saveWorkspaceFields()"
+               placeholder="Optional instructions for this workspace">
+      </div>
+    </div>
+    <template x-if="coherenceBanner">
+      <div class="flash flash-warn" style="margin-top:10px;margin-bottom:0" x-text="coherenceBanner"></div>
+    </template>
   </div>
 
   <div style="display: grid; gap: 24px; grid-template-columns: minmax(0, 1fr) 260px;"
@@ -143,7 +174,7 @@
               <h3>No model is being served</h3>
               <div class="thread-empty-sub">
                 Load a model before chatting:
-                <a href="{{ url_for('settings.server') }}">Server</a> for one Mac, or
+                <a href="{{ url_for('models.models_page') }}">Models (Fit-gated)</a> for one Mac, or
                 <a href="{{ url_for('cluster.cluster_page') }}">Cluster</a> to shard a large
                 model across Macs over Thunderbolt. Or use a
                 <strong>cloud API</strong> above.
@@ -258,6 +289,39 @@
                       <summary x-text="g.m.content ? 'reasoning' : 'reasoning (only output)'"></summary>
                       <pre x-text="g.m.reasoning"></pre>
                     </details>
+                  </template>
+                  {# Run health + provenance (WP-2B) #}
+                  <template x-if="g.m.role === 'assistant' && (g.m.health || g.m.provenance)">
+                    <div class="run-health" @click="openProvenance(g.m)">
+                      <template x-if="g.m.health && g.m.health.context_window">
+                        <span class="chip" x-text="'ctx ' + (g.m.health.context_used || '?') + '/' + g.m.health.context_window"></span>
+                      </template>
+                      <template x-if="g.m.health && g.m.health.healed">
+                        <span class="chip chip-warn">healed</span>
+                      </template>
+                      <template x-if="g.m.health && !g.m.health.healed && g.m.health.tools_called">
+                        <span class="chip chip-on">clean tools</span>
+                      </template>
+                      <template x-if="g.m.health && g.m.health.retrieval_empty">
+                        <span class="chip chip-err">empty retrieval</span>
+                      </template>
+                      <template x-if="g.m.health && g.m.health.retrieved_chunks > 0">
+                        <span class="chip" x-text="g.m.health.retrieved_chunks + ' chunks'"></span>
+                      </template>
+                      <template x-if="g.m.health && g.m.health.retry_hits">
+                        <span class="chip chip-warn" x-text="'retries ' + g.m.health.retry_hits"></span>
+                      </template>
+                      <template x-if="g.m.tok_per_sec || (g.m.health && g.m.health.tok_per_sec)">
+                        <span class="chip" x-text="(g.m.tok_per_sec || g.m.health.tok_per_sec) + ' tok/s'"></span>
+                      </template>
+                      <span class="chip chip-btn">inspect ⌄</span>
+                    </div>
+                  </template>
+                  <template x-if="g.m.role === 'assistant' && g.m === lastAssistant()">
+                    <div class="msg-actions">
+                      <button type="button" class="btn btn-ghost btn-sm" @click="regenerate()" :disabled="streaming">Regenerate</button>
+                      <button type="button" class="btn btn-ghost btn-sm" @click="editResend()" :disabled="streaming">Edit &amp; resend</button>
+                    </div>
                   </template>
                 </div>
               </template>
@@ -470,10 +534,12 @@
 
     <div x-show="!artifact">
       <div class="side-label" style="margin-bottom: 8px;">Saved</div>
-      <template x-if="chats.length === 0">
+      <input class="input" type="search" x-model="chatQuery" @input.debounce.300ms="refreshList()"
+             placeholder="Search chats…" style="margin-bottom:8px;font-size:13px">
+      <template x-if="filteredChats().length === 0">
         <div class="empty" style="padding: 16px; font-size: 13px;">No saved chats yet.</div>
       </template>
-      <template x-for="c in chats" :key="c.id">
+      <template x-for="c in filteredChats()" :key="c.id">
         <div class="card" style="padding: 10px 12px; margin-bottom: 6px;">
           <div style="display: flex; justify-content: space-between; gap: 6px;">
             <a href="#" @click.prevent="load(c.id)" style="font-weight: 500;" x-text="c.title"></a>
@@ -482,6 +548,28 @@
           <div style="font-size: 11px; color: var(--mute);" x-text="c.n_messages + ' msgs · ' + (c.model || '').split('/').pop()"></div>
         </div>
       </template>
+    </div>
+  </div>
+
+  {# Provenance drawer #}
+  <div class="prov-drawer" x-show="provenanceMsg" x-cloak @click.self="provenanceMsg = null">
+    <div class="prov-panel" @click.stop>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h3 style="margin:0">Provenance</h3>
+        <button type="button" class="btn btn-ghost btn-sm" @click="provenanceMsg = null">Close</button>
+      </div>
+      <template x-if="provenanceMsg && (provenanceMsg.provenance || provenanceMsg.health)">
+        <div class="prov-rows">
+          <template x-for="row in provenanceRows(provenanceMsg)" :key="row.k">
+            <div class="prov-row">
+              <span class="k" x-text="row.k"></span>
+              <span class="v" x-text="row.v"></span>
+            </div>
+          </template>
+        </div>
+      </template>
+      <button type="button" class="btn btn-secondary" style="margin-top:14px;width:100%"
+              @click="exportProvenance()">Export JSON</button>
     </div>
   </div>
 </div>
@@ -922,6 +1010,26 @@ body.artifact-open .app-main { max-width: 1560px; }
 .src-n { font-weight: 700; color: var(--accent, #03684c); }
 .src-file { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
 .src-prev { color: var(--mute); overflow: hidden; text-overflow: ellipsis; }
+
+/* WP-2: modes, run health, provenance */
+.seg-modes { display: inline-flex; border: 1px solid var(--rule); border-radius: 999px; overflow: hidden; }
+.seg-btn { border: 0; background: transparent; padding: 6px 12px; font-size: 12px; cursor: pointer; color: var(--mute); }
+.seg-btn.is-on { background: var(--accent); color: #fff; }
+.run-health { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; cursor: pointer; max-width: 640px; }
+.msg-actions { display: flex; gap: 6px; margin-top: 6px; }
+.ws-bar label { font-size: 11px; color: var(--mute); display: block; margin-bottom: 4px; }
+.flash-warn { background: #f8e6c8; color: var(--warn); border: 1px solid #e8c48a; padding: 10px 12px; border-radius: var(--r-md); font-size: 13px; }
+.prov-drawer {
+  position: fixed; inset: 0; z-index: 80;
+  background: rgba(30,28,24,.4); display: flex; justify-content: flex-end;
+}
+.prov-panel {
+  width: min(420px, 100%); height: 100%; background: var(--paper);
+  box-shadow: -8px 0 24px rgba(0,0,0,.12); padding: 20px; overflow-y: auto;
+}
+.prov-row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--rule-soft); font-size: 13px; }
+.prov-row .k { color: var(--mute); flex: none; }
+.prov-row .v { text-align: right; word-break: break-word; }
 </style>
 
 <script>
@@ -969,12 +1077,20 @@ function chatApp() {
     modelServed: true,      // until the first status poll says otherwise
     servedModel: null,
     chats: {{ chats | tojson }},
+    chatQuery: '',
+    workspaces: [],
+    workspaceId: localStorage.getItem('optiq.chat.workspaceId') || '',
+    systemPrompt: '',
+    coherenceBanner: '',
+    provenanceMsg: null,
+    lastHealth: null,
     // Per-send cancellation handles
     sessionId: null,
     abortCtrl: null,
 
     async init() {
       await this.refreshList();
+      await this.loadWorkspaces();
       try {
         const r = await fetch('/api/sandbox/info', {credentials: 'same-origin'});
         if (r.ok) {
@@ -1158,9 +1274,10 @@ function chatApp() {
     },
 
     // Tools path: SSE from /api/chat/stream
-    async _sendWithTools() {
+    _apiMessagesBase() {
       const apiMessages = this.messages
-        .filter(m => m.role !== 'tool' || !m.tool_card)  // strip UI-only tool cards
+        .filter(m => m.role !== 'tool' || !m.tool_card)
+        .filter(m => !m.research)
         .map(({role, content, tool_calls, tool_call_id, name}) => {
           const m = { role, content };
           if (tool_calls) m.tool_calls = tool_calls;
@@ -1168,6 +1285,14 @@ function chatApp() {
           if (name) m.name = name;
           return m;
         });
+      if (this.systemPrompt && this.systemPrompt.trim()) {
+        apiMessages.unshift({ role: 'system', content: this.systemPrompt.trim() });
+      }
+      return apiMessages;
+    },
+
+    async _sendWithTools() {
+      const apiMessages = this._apiMessagesBase();
 
       let pendingByCall = {};
       this.abortCtrl = new AbortController();
@@ -1190,6 +1315,7 @@ function chatApp() {
             adapter: this.selectedAdapter
                      ? this.adapterNameFor(this.selectedAdapter)
                      : null,
+            chat_id: this.id || undefined,
             // Cloud endpoint (OpenRouter, any OpenAI-compatible): the backend
             // proxies here with the user's own key. Empty -> local server.
             base_url: this._cloudActive() ? this.cloudBaseUrl : undefined,
@@ -1427,16 +1553,26 @@ function chatApp() {
         // of the prose). Swap in the corrected transcript for this turn.
         this.partial = ev.data.text || '';
         this.scrollBottom();
+      } else if (ev.event === 'health') {
+        this.lastHealth = ev.data || null;
       } else if (ev.event === 'assistant') {
+        const health = this._mergeHealth(this.lastHealth, {
+          tok_per_sec: this.tokPerSec,
+          retrieved_chunks: (this.lastSources || []).length,
+          retrieval_empty: (this.documents || []).length > 0 && !(this.lastSources || []).length,
+        });
         this.messages.push({
           role: 'assistant',
           content: ev.data.content || '',
           reasoning: ev.data.reasoning || undefined,
           sources: this.lastSources.length ? this.lastSources : undefined,
           tok_per_sec: this.tokPerSec,
+          health,
+          provenance: this._buildClientProvenance(health),
         });
         this.partial = '';
         this.lastSources = [];
+        this.lastHealth = null;
       } else if (ev.event === 'error') {
         this.messages.push({ role: 'assistant', content: '(error: ' + (ev.data.message || 'unknown') + ')' });
       }
@@ -1525,7 +1661,179 @@ function chatApp() {
         assembled = '(error: ' + e.message + ')';
       }
 
-      this.messages.push({ role: 'assistant', content: assembled, reasoning: reasoning || undefined, tok_per_sec: this.tokPerSec });
+      const health = this._mergeHealth(null, {
+        tok_per_sec: this.tokPerSec,
+        healed: false,
+        tools_called: [],
+        retrieved_chunks: (this.lastSources || []).length,
+        retrieval_empty: (this.documents || []).length > 0 && !(this.lastSources || []).length,
+      });
+      this.messages.push({
+        role: 'assistant',
+        content: assembled,
+        reasoning: reasoning || undefined,
+        tok_per_sec: this.tokPerSec,
+        health,
+        provenance: this._buildClientProvenance(health),
+      });
+    },
+
+    lastAssistant() {
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        if (this.messages[i].role === 'assistant' && !this.messages[i].research) return this.messages[i];
+      }
+      return null;
+    },
+    filteredChats() {
+      return this.chats || [];
+    },
+    _mergeHealth(base, extra) {
+      return Object.assign({
+        healed: false, retry_hits: 0, tools_called: [], retrieved_chunks: 0,
+        retrieval_empty: false, context_window: null, context_used: null, tok_per_sec: null,
+      }, base || {}, extra || {});
+    },
+    _buildClientProvenance(health) {
+      const h = health || {};
+      return {
+        server_model_label: this.model || this.servedModel || null,
+        sampler: { temperature: this.temperature, max_tokens: this.maxTokens },
+        tools_called: h.tools_called || [],
+        healed: !!h.healed,
+        retry_hits: h.retry_hits || 0,
+        retrieved_chunk_ids: h.retrieved_chunks ? Array.from({length: h.retrieved_chunks}, (_, i) => i + 1) : [],
+        context_window: h.context_window ?? null,
+        context_used: h.context_used ?? null,
+        tok_per_sec: h.tok_per_sec ?? null,
+        peak_mem_gb: null,
+        captured_at: new Date().toISOString(),
+        workspace_id: this.workspaceId || null,
+      };
+    },
+    openProvenance(m) { this.provenanceMsg = m; },
+    provenanceRows(m) {
+      const p = Object.assign({}, m.provenance || {}, m.health || {});
+      const rows = [];
+      const put = (k, v) => { if (v !== undefined && v !== null && v !== '') rows.push({k, v: typeof v === 'object' ? JSON.stringify(v) : String(v)}); };
+      put('Model', p.server_model_label);
+      put('Workspace', p.workspace_id);
+      put('Sampler', p.sampler);
+      put('Healed', p.healed);
+      put('Retry hits', p.retry_hits);
+      put('Tools', p.tools_called);
+      put('Retrieved chunks', p.retrieved_chunks ?? (p.retrieved_chunk_ids || []).length);
+      put('Empty retrieval', p.retrieval_empty);
+      put('Context', p.context_window != null ? ((p.context_used ?? '?') + ' / ' + p.context_window) : null);
+      put('tok/s', p.tok_per_sec);
+      put('Captured', p.captured_at);
+      return rows;
+    },
+    exportProvenance() {
+      const m = this.provenanceMsg;
+      if (!m) return;
+      const blob = new Blob([JSON.stringify({ health: m.health, provenance: m.provenance }, null, 2)], {type: 'application/json'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'provenance.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    },
+    async loadWorkspaces() {
+      try {
+        const r = await fetch('/api/workspaces', { credentials: 'same-origin' });
+        if (r.ok) {
+          const d = await r.json();
+          this.workspaces = d.workspaces || [];
+          if (this.workspaceId) await this.onWorkspaceChange();
+        }
+      } catch (e) {}
+    },
+    async createWorkspace() {
+      const name = prompt('Workspace name');
+      if (!name) return;
+      const r = await fetch('/api/workspaces', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          name,
+          system_prompt: this.systemPrompt || '',
+          sampler_json: { temperature: this.temperature, max_tokens: this.maxTokens },
+        }),
+      });
+      if (!r.ok) return;
+      const ws = await r.json();
+      this.workspaces = [ws, ...this.workspaces];
+      this.workspaceId = ws.id;
+      localStorage.setItem('optiq.chat.workspaceId', ws.id);
+      await this.onWorkspaceChange();
+    },
+    async onWorkspaceChange() {
+      localStorage.setItem('optiq.chat.workspaceId', this.workspaceId || '');
+      this.coherenceBanner = '';
+      if (!this.workspaceId) return;
+      const r = await fetch('/api/workspaces/' + encodeURIComponent(this.workspaceId), { credentials: 'same-origin' });
+      if (!r.ok) return;
+      const ws = await r.json();
+      this.systemPrompt = ws.system_prompt || '';
+      const samp = ws.sampler_json || {};
+      if (samp.temperature != null) this.temperature = Number(samp.temperature);
+      if (samp.max_tokens != null) this.maxTokens = Number(samp.max_tokens);
+      const flags = ws.coherence_flags_json || {};
+      const resident = this.servedModel || this.model || '';
+      const want = ws.default_build_id || '';
+      if (want && resident && want !== resident && !resident.endsWith(want) && !want.endsWith(resident)) {
+        this.coherenceBanner = 'Workspace expects model “' + want + '” but machine has “' + (resident || 'none') + '”. Load the workspace model from Models, or update the workspace.';
+      } else if (flags.model_not_resident) {
+        this.coherenceBanner = 'Workspace model is not resident on the machine. Load it from Models.';
+      }
+    },
+    async saveWorkspaceFields() {
+      if (!this.workspaceId) return;
+      await fetch('/api/workspaces/' + encodeURIComponent(this.workspaceId), {
+        method: 'PATCH', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          system_prompt: this.systemPrompt,
+          sampler_json: { temperature: this.temperature, max_tokens: this.maxTokens },
+        }),
+      });
+    },
+    branchThread() {
+      this.id = null;
+      alert('Branched: new chat id will be assigned on Save. History kept in this view.');
+    },
+    async regenerate() {
+      if (this.streaming) return;
+      // Drop trailing assistant + tool cards after last user
+      let i = this.messages.length - 1;
+      while (i >= 0 && this.messages[i].role !== 'user') {
+        this.messages.splice(i, 1);
+        i--;
+      }
+      if (i < 0) return;
+      // Re-send without pushing a new user message
+      const last = this.messages[i];
+      this.input = typeof last.content === 'string' ? last.content : '';
+      this.messages.splice(i, 1);
+      await this.send();
+    },
+    async editResend() {
+      if (this.streaming) return;
+      let i = this.messages.length - 1;
+      while (i >= 0 && this.messages[i].role !== 'user') {
+        this.messages.splice(i, 1);
+        i--;
+      }
+      if (i < 0) return;
+      const last = this.messages[i];
+      const text = typeof last.content === 'string'
+        ? last.content
+        : (Array.isArray(last.content) ? (last.content.find(p => p.type === 'text')?.text || '') : '');
+      const edited = prompt('Edit message and resend:', text);
+      if (edited == null) return;
+      this.messages.splice(i, 1);
+      this.input = edited;
+      await this.send();
     },
 
     async save() {
@@ -1541,12 +1849,17 @@ function chatApp() {
         const out = { role: m.role, content: m.content };
         if (m.reasoning) out.reasoning = m.reasoning;
         if (m.tool_calls) out.tool_calls = m.tool_calls;
+        if (m.health) out.health = m.health;
+        if (m.provenance) out.provenance = m.provenance;
         return out;
       });
       const resp = await fetch('/api/chats', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ id: this.id, title, model: this.model, messages: cleaned }),
+        body: JSON.stringify({
+          id: this.id, title, model: this.model, messages: cleaned,
+          workspace_id: this.workspaceId || undefined,
+        }),
         credentials: 'same-origin',
       });
       if (resp.ok) {
@@ -1575,7 +1888,9 @@ function chatApp() {
     },
 
     async refreshList() {
-      const resp = await fetch('/api/chats', {credentials: 'same-origin'});
+      const q = (this.chatQuery || '').trim();
+      const url = q ? ('/api/chats?q=' + encodeURIComponent(q)) : '/api/chats';
+      const resp = await fetch(url, {credentials: 'same-origin'});
       if (resp.ok) {
         const data = await resp.json();
         this.chats = data.chats || [];
