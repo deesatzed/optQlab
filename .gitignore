@@ -6,7 +6,9 @@ __pycache__/
 *.egg-info/
 .eggs/
 dist/
-build/
+# Python packaging build dirs only (not docs/build/)
+/build/
+mlx-optiq-dev/build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

@@ -1,0 +1,10 @@
+4b92768 test(lab): Phase 0 acceptance suite
+eef1915 feat(lab): backfill builds and chats into spine
+d23c0d7 feat(lab): partial provenance capture from chat stream context
+d8a1f59 feat(lab): spine API for events bus and provenance export
+f7a97fd feat(lab): sequential job bus with events and cancel
+e682eae feat(lab): dual-write chat store with migrate-on-read
+54569f7 feat(lab): spine repositories for workspace/build/conversation/provenance
+3f6e67c feat(lab): append-only events repository
+8cf0e5f feat(lab): schema v2 spine tables for Phase 0
+806e0e0 Bootstrap editable worktree from mlx-optiq 0.4.7
